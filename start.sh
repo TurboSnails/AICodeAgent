@@ -19,6 +19,54 @@ echo "========================================"
 : "${ANDROID_HOME:?请设置 ANDROID_HOME 环境变量}"
 : "${JAVA_HOME:?请设置 JAVA_HOME 环境变量}"
 
+# --- 依赖检查 ---
+_check_cmd() {
+    if ! command -v "$1" &> /dev/null; then
+        echo "[ERROR] 依赖缺失: $1 未安装或未在 PATH 中"
+        exit 1
+    fi
+}
+
+echo "[CHECK] 验证核心依赖..."
+_check_cmd python3
+python3 --version
+
+_check_cmd claude
+claude --version || { echo "[ERROR] claude CLI 不可用"; exit 1; }
+
+_check_cmd gh
+gh --version || { echo "[ERROR] gh CLI 不可用"; exit 1; }
+
+_check_cmd java
+java -version 2>&1 | head -n 1
+
+if command -v node &> /dev/null; then
+    echo "[CHECK] node $(node -v)（Figma download:site 需要）"
+else
+    echo "[WARN] node 未安装，带 site_hint 的 Figma 资产拉取将失败"
+fi
+
+if [ -f "$PROJECT_ROOT/figma-tools/package.json" ]; then
+    echo "[CHECK] figma-tools 已就绪"
+else
+    echo "[WARN] figma-tools 目录不存在"
+fi
+
+if [ -n "${FIGMA_TOKEN:-}" ] || [ -f "$PROJECT_ROOT/figma-tools/.env" ]; then
+    echo "[CHECK] FIGMA_TOKEN 或 figma-tools/.env 已配置"
+else
+    echo "[WARN] 未设置 FIGMA_TOKEN，UI 类任务可能缺少设计资产"
+fi
+
+if [ -n "${AGENT_API_KEY:-}" ]; then
+    echo "[CHECK] AGENT_API_KEY 已设置（Web UI 认证启用）"
+else
+    echo "[WARN] AGENT_API_KEY 未设置，Web UI /api/trigger 等端点将无认证保护"
+fi
+
+echo "[CHECK] 所有依赖检查通过"
+echo ""
+
 # --- 创建目录 ---
 mkdir -p "$DATA_DIR" "$PID_DIR" "$LOG_DIR" "$PROJECT_ROOT/AICodeAgent/workspace" "$PROJECT_ROOT/AICodeAgent/db"
 

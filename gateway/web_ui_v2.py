@@ -9,6 +9,7 @@ Headless Agent Web UI Gateway V2
 import http.server
 import json
 import os
+import re
 import socketserver
 import sqlite3
 import sys
@@ -25,6 +26,10 @@ PORT = 6789
 sys.path.insert(0, str(PROJECT_ROOT / "AICodeAgent" / "orchestrator"))
 from state_machine import init_db, save_task, Task, get_task, approve_gate_resume, cancel_task, State
 from platform_figma import list_platform_sites_for_ui
+
+API_TOKEN = os.environ.get("AGENT_API_KEY", "").strip()
+MAX_REQUIREMENT_LEN = 5000
+VALID_LEVELS = {"auto", "L0", "L1", "L2"}
 
 
 def scan_sites() -> list[dict]:
@@ -139,10 +144,18 @@ async function continueTask(tid) {
   refreshGates();
   refreshTasks();
 }
+function getToken() {
+  let t = localStorage.getItem('agent_api_key');
+  if (!t) {
+    t = prompt('请输入 API Key（首次使用）');
+    if (t) localStorage.setItem('agent_api_key', t);
+  }
+  return t || '';
+}
 async function cancelTask(tid) {
   if (!confirm('确定要取消任务 ' + tid + ' 吗？')) return;
   const res = await fetch('/api/cancel', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + getToken() },
     body: JSON.stringify({ task_id: tid })
   });
   const data = await res.json();
@@ -154,7 +167,7 @@ document.getElementById('taskForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = new FormData(e.target);
   const res = await fetch('/api/trigger', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + getToken() },
     body: JSON.stringify({ raw_requirement: form.get('requirement'), level: form.get('level'), site_hint: form.get('site_hint') })
   });
   const data = await res.json();
@@ -183,6 +196,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
+    def _check_auth(self):
+        if not API_TOKEN:
+            return True
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            self._json({"ok": False, "message": "missing Authorization header"}, 401)
+            return False
+        token = auth[7:].strip()
+        if token != API_TOKEN:
+            self._json({"ok": False, "message": "invalid token"}, 401)
+            return False
+        return True
+
+    def _validate_trigger(self, payload: dict) -> tuple[bool, str]:
+        req = payload.get("raw_requirement", "").strip()
+        if not req:
+            return False, "需求描述不能为空"
+        if len(req) > MAX_REQUIREMENT_LEN:
+            return False, f"需求描述过长（>{MAX_REQUIREMENT_LEN} 字符）"
+        level = payload.get("level", "auto")
+        if level not in VALID_LEVELS:
+            return False, f"level 必须是 {VALID_LEVELS} 之一"
+        site = payload.get("site_hint", "")
+        if site:
+            valid_sites = {s["value"] for s in scan_sites()}
+            if site not in valid_sites:
+                return False, f"site_hint '{site}' 不在可用站点列表中"
+        return True, ""
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.end_headers()
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
@@ -190,6 +239,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(INDEX_HTML.encode("utf-8"))
+        elif path.startswith("/api/task/"):
+            tid = path[len("/api/task/"):].strip("/")
+            task = get_task(tid)
+            if not task:
+                self._json({"ok": False, "message": f"任务 {tid} 不存在"}, 404)
+                return
+            self._json({
+                "ok": True,
+                "task": {
+                    "task_id": task.task_id,
+                    "raw_requirement": task.raw_requirement,
+                    "level": task.level,
+                    "site_hint": task.site_hint,
+                    "current_state": task.current_state,
+                    "pr_url": task.pr_url,
+                    "branch": task.branch,
+                    "error_log": task.error_log[:500] if task.error_log else "",
+                    "created_at": task.created_at,
+                    "updated_at": task.updated_at,
+                },
+            })
         elif path == "/api/tasks":
             conn = sqlite3.connect(str(DB_FILE))
             cursor = conn.execute("SELECT task_id, raw_requirement, level, site_hint, current_state, pr_url, created_at FROM task_queue ORDER BY created_at DESC LIMIT 50")
@@ -237,10 +307,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8")
         if path == "/api/trigger":
+            if not self._check_auth():
+                return
             try:
                 payload = json.loads(body) if body else {}
             except Exception:
                 self._json({"ok": False, "message": "invalid json"}, 400)
+                return
+            ok, err = self._validate_trigger(payload)
+            if not ok:
+                self._json({"ok": False, "message": err}, 400)
                 return
             task_id = str(uuid.uuid4())[:8]
             task = Task(
@@ -251,13 +327,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 source="web",
                 chat_id=""
             )
-            if not task.raw_requirement:
-                self._json({"ok": False, "message": "需求描述不能为空"}, 400)
-                return
             save_task(task)
             self._json({"ok": True, "message": f"任务已提交 (ID: {task_id})", "task_id": task_id})
             return
         if path == "/api/continue":
+            if not self._check_auth():
+                return
             try:
                 payload = json.loads(body) if body else {}
             except Exception:
@@ -277,6 +352,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"ok": False, "message": "核准失败"}, 500)
             return
         if path == "/api/cancel":
+            if not self._check_auth():
+                return
             try:
                 payload = json.loads(body) if body else {}
             except Exception:

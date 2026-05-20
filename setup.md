@@ -94,7 +94,11 @@ nohup python3 AICodeAgent/gateway/telegram_bot_v2.py > /tmp/agent_bot.log 2>&1 &
 ## 5. 首次测试
 
 ```bash
-# L0 轻量任务测试
+# 一键 smoke（需先 ./AICodeAgent/start.sh）
+chmod +x AICodeAgent/scripts/smoke_l0.sh
+AICodeAgent/scripts/smoke_l0.sh
+
+# 或手动 L0
 curl -X POST http://localhost:6789/api/trigger \
   -H "Content-Type: application/json" \
   -d '{
@@ -118,7 +122,7 @@ curl -X POST http://localhost:6789/api/trigger \
 ## 6. 目录结构确认
 
 ```
-headlessAgent/
+AICodeAgent/
 ├── data/
 │   ├── agent.db              # SQLite 数据库 (自动创建)
 │   └── executor.lock         # 文件锁 (自动创建)
@@ -131,7 +135,7 @@ headlessAgent/
 
 | 问题 | 排查 |
 |------|------|
-| Executor 启动失败 | 检查 `pip3 install requests`，确认 `headlessAgent/data/` 可写 |
+| Executor 启动失败 | 检查 `pip3 install -r AICodeAgent/requirements.txt`，确认 `AICodeAgent/data/` 可写 |
 | Web UI 无法访问 | 确认端口 6789 未被占用，检查防火墙 |
 | Claude --print 无输出 | 运行 `claude --print "hello"` 验证 CLI 安装 |
 | Gradle 构建超时 | 检查 `ANDROID_HOME` 和 `JAVA_HOME` 配置 |

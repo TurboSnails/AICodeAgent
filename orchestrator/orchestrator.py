@@ -1288,6 +1288,24 @@ def generate_docs(task: Task, workspace: Path):
     )
 
 
+def bootstrap_l0_consensus(task: Task, workspace: Path):
+    """L0 轻量任务：不写辩论 Agent，生成最小 consensus 供编码阶段使用"""
+    (workspace / "consensus.md").write_text(
+        f"# consensus.md — L0 快速方案\n\n"
+        f"## 任务概述\n"
+        f"- 需求: {task.raw_requirement}\n"
+        f"- 等级: L0（跳过 Multi-Agent Debate）\n\n"
+        f"## 技术方案\n"
+        f"- 按需求直接修改目标文件，保持现有代码风格\n"
+        f"- 站点: {task.site_hint or _get_current_site_name() or '当前 Configs.site'}\n\n"
+        f"## 最终文件清单\n"
+        f"| 文件 | 操作 | 说明 |\n"
+        f"|------|------|------|\n"
+        f"| （见需求） | 修改 | Claude 根据需求推断路径并输出 === FILE: === 块 |\n",
+        encoding="utf-8",
+    )
+
+
 def _get_current_site_name() -> str:
     """从 Configs.kt 提取当前 active site 的 enName（小写，去 Debug/Release 后缀）"""
     configs = PROJECT_ROOT / "buildSrc" / "src" / "main" / "kotlin" / "Configs.kt"
@@ -1674,6 +1692,15 @@ def process_task(task: Task):
 
         prepare_asset_context(task, ws)
 
+        # L0：跳过三方辩论，直接进入编码（节省 claude 调用）
+        if task.level == "L0":
+            transition(task.task_id, State.DEBATING, "L0 fast path (skip agents)")
+            transition(task.task_id, State.CONSENSUS, "L0 minimal consensus")
+            bootstrap_l0_consensus(task, ws)
+            build_asset_map(ws)
+            run_coding_build_pr(task, ws)
+            return
+
         transition(task.task_id, State.DEBATING, "starting multi-agent debate")
         if not run_agent_debate(task, ws):
             task.error_log = "Debate stage failed or timed out"
@@ -1699,6 +1726,8 @@ def process_task(task: Task):
             transition(task.task_id, State.WAITING_GATE, "L2 gate waiting for /continue")
             _notify_l2_gate(task)
             return
+
+        run_coding_build_pr(task, ws)
     finally:
         # 无论成功/失败/L2 等待，都恢复环境（L2 等待时也需要恢复，因为编码阶段还未开始）
         _restore_task_environment(task, original_branch, git_snapshot, original_configs)

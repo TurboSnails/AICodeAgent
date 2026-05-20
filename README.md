@@ -87,7 +87,7 @@ stateDiagram-v2
 ## 目录结构
 
 ```
-headlessAgent/
+AICodeAgent/
 ├── README.md                        # 本文件
 ├── ARCHITECTURE_v3.md               # V3 详细架构蓝图
 ├── IMPLEMENTATION_v2.md             # V2 源码参考（供回溯）

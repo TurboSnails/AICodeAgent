@@ -1,0 +1,2 @@
+# AICodeAgent Python 依赖（网关通知、Figma API）
+requests>=2.28.0,<3

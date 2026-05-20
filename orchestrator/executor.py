@@ -4,10 +4,12 @@ Serial Task Executor
 - 文件锁确保单进程运行
 - SQLite 队列 dequeue
 - 为每个任务创建独立工作区
+- SIGTERM/SIGINT 优雅关闭
 """
 
 import fcntl
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -18,6 +20,15 @@ from orchestrator import process_task
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WORKSPACE_ROOT = PROJECT_ROOT / "AICodeAgent" / "workspace"
 LOCK_FILE = PROJECT_ROOT / "AICodeAgent" / "data" / "executor.lock"
+
+_shutdown_requested = False
+_current_task_id: str = ""
+
+
+def _signal_handler(signum, frame):
+    global _shutdown_requested
+    print(f"[Executor] Received signal {signum}, shutting down gracefully...")
+    _shutdown_requested = True
 
 
 def acquire_lock():
@@ -87,18 +98,42 @@ def _check_stalled_tasks():
         transition(tid, State.FAILED, f"total timeout exceeded ({int(elapsed)}s)")
 
 
+_CLEANUP_INTERVAL_SEC = 3600  # 每小时清理一次旧工作区
+_last_cleanup = 0
+
+
+def _cleanup_all_workspaces(max_age_days: int = 7):
+    if not WORKSPACE_ROOT.exists():
+        return
+    for ws_dir in WORKSPACE_ROOT.iterdir():
+        if ws_dir.is_dir():
+            cleanup_workspace(ws_dir.name, max_age_days)
+
+
 def run_loop():
+    global _shutdown_requested, _current_task_id, _last_cleanup
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
     init_db()
     print(f"[Executor] Serial task executor started (task_total_timeout={TASK_TOTAL_TIMEOUT_SEC}s)")
-    while True:
+    while not _shutdown_requested:
         lock_fd = acquire_lock()
         if lock_fd is None:
+            if _shutdown_requested:
+                break
             print("[Executor] Another instance is running, waiting...")
             time.sleep(10)
             continue
         try:
             # 健康检查：清理超时任务
             _check_stalled_tasks()
+
+            # 定期清理旧工作区
+            now = time.time()
+            if now - _last_cleanup > _CLEANUP_INTERVAL_SEC:
+                print("[Executor] Running periodic workspace cleanup...")
+                _cleanup_all_workspaces()
+                _last_cleanup = now
 
             tasks = get_executable_tasks(limit=1)
             if not tasks:
@@ -111,15 +146,25 @@ def run_loop():
                 time.sleep(5)
                 continue
             task = tasks[0]
+            _current_task_id = task.task_id
             print(f"[Executor] Processing task {task.task_id}")
             try:
                 process_task(task)
             except Exception as e:
                 print(f"[Executor] Task {task.task_id} failed: {e}")
                 transition(task.task_id, State.FAILED, str(e))
+            finally:
+                _current_task_id = ""
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
+
+    # 优雅关闭：如果正在处理任务，尝试取消
+    if _current_task_id:
+        print(f"[Executor] Cancelling in-flight task {_current_task_id} due to shutdown")
+        transition(_current_task_id, State.CANCELLED, "executor shutdown")
+
+    print("[Executor] Shutdown complete")
 
 
 if __name__ == "__main__":
