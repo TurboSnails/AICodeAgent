@@ -1,23 +1,32 @@
 # 🤖 Android Headless Agent 自动化流水线 V3
 
-> 版本: 3.0.0 | Android + Jetpack Compose 多站点项目  
-> 核心流派: **Multi-Agent Debate & Full Autonomy**  
-> 目标: 人类只扔需求和 Figma，剩下全部交给 AI 自己吵、自己定、自己写、自己修
+> 版本: 3.1.0 | Android + Jetpack Compose 多站点项目  
+> 核心流派: **Multi-Agent Debate + 可控人工闸门**  
+> 目标: 人类扔需求和 Figma；**需求不清时先反问**；方案由 AI 辩论；编码/构建/逻辑审查尽量全自动
 
 ---
 
-## V3 核心改进
+## V3 核心能力
 
-| 维度 | V2 | V3 |
-|------|----|----|
-| **决策机制** | Orchestrator 单点决策 | **Multi-Agent Debate** 三方辩论达成共识 |
-| **Claude 契约** | 只写代码，不跑构建 | **完全自主 (No-Ask)**：自己判断、自己决策、自己纠错 |
-| **Figma 集成** | 编码前拉取颜色和静态资产 | **多模态视觉对齐**：自动嗅探、去重、转 VectorDrawable |
-| **上下文注入** | 静态 `CLAUDE_HEADLESS.md` | **RAG 动态索引**：自动抽取项目最佳实践作为 Few-Shot |
-| **架构设计** | L1/L2 由 Orchestrator 判定等级 | **Architect + FigmaAuditor + Guardian** 辩论后出方案 |
-| **资源管理** | 人工确认 / 手动放置 | **AI 自动判断**：复用本地 / 下载新图 / 自动命名入库 |
-| **终止条件** | Gradle 全绿 | **Gradle 全绿 + 零人工交互** |
-| **人类角色** | 回答 AI 问题、确认 L2 闸门 | **甩手掌柜**：只发需求，其他一切不管 |
+| 维度 | 说明 |
+|------|------|
+| **决策机制** | Architect + FigmaAuditor + Guardian **三方辩论** → Consensus 出 `consensus.md` |
+| **需求 Intake** | Planning 后若信息不足 → **`waiting_clarification`**，用户 `/reply` 或 Web 澄清后再辩论 |
+| **编码契约** | Claude `--print` **只写代码**；Gradle / git / PR 由 Orchestrator 执行 |
+| **构建纠错** | Gradle 失败 → `correcting` → fix prompt 重试（`max_retries` 默认 3） |
+| **逻辑审查** | **Gradle 全绿后** → `codex_review`（Codex CLI 或 Claude 审查员）查逻辑/漏洞/回归，FAIL 再修 |
+| **L2 闸门** | 辩论+共识后暂停 `waiting_gate`，`/continue` 或 Web 核准后再编码 |
+| **L0 快路径** | 跳过辩论，最小共识后直接编码 |
+| **视觉资产** | Code-First：`asset_analysis` → Figma 按需拉取 → `asset_map.json` |
+| **图谱上下文** | 可选 `graph_bridge` + CRG HTTP：语义检索 + 影响面（Codex/Architect 用） |
+
+### 与「完全 No-Ask」的区别
+
+| 场景 | 行为 |
+|------|------|
+| 需求模糊（缺页面/站点/验收标准等） | **必须反问用户**，不进入辩论 |
+| L2 复杂任务 | 共识后 **人工核准** 再编码 |
+| 编码/构建/审查阶段 | **不向人类提问**，自动 fix |
 
 ---
 
@@ -26,35 +35,29 @@
 ```mermaid
 graph TD
     A[用户] -->|POST /api/trigger| B[Web UI :6789]
-    A -->|/task| C[Telegram Bot]
-    B -->|enqueue| D[(SQLite Queue)]
+    A -->|/task /reply| C[Telegram Bot]
+    B -->|enqueue| D[(SQLite WAL)]
     C -->|enqueue| D
-    D -->|dequeue| E[Serial Executor]
-    E -->|file lock| F[Workspace {task_id}/]
+    D -->|dequeue| E[Serial Executor + 文件锁]
+    E --> F[workspace/task_id/]
 
-    E -->|1. Planning| G[Multi-Agent Debate]
-    G -->|Agent A| H[Architect]
-    G -->|Agent B| I[Figma Auditor]
-    G -->|Agent C| J[Guardian]
-    H -->|proposal| K[Consensus Agent]
-    I -->|audit| K
-    J -->|review| K
-    K -->|consensus.md| F
+    E -->|Planning + Intake| G{需求明确?}
+    G -->|否| H[waiting_clarification]
+    H -->|/reply| D
+    G -->|是| I[Multi-Agent Debate]
+    I --> J[Consensus → consensus.md]
+    J -->|L2| K[waiting_gate → /continue]
+    J -->|L0/L1| L[Claude 编码]
+    K --> L
 
-    F -->|2. Coding| L[Claude Code --print]
-    L -->|只写代码| F
-    E -->|3. Build| M[Gradle Build]
-    M -->|失败| N[Course-Correct]
-    N -->|fix prompt| L
-    M -->|成功| O[Git Commit & PR]
+    L --> M[Gradle Build]
+    M -->|失败| N[correcting → fix prompt]
+    N --> L
+    M -->|全绿| O[Codex 逻辑审查]
+    O -->|FAIL| N
+    O -->|PASS| P[Git Commit & PR]
 
-    P[Figma REST API] -->|自动嗅探| Q[Asset Deduplication]
-    Q -->|复用| R[res/drawable/]
-    Q -->|新资产| S[SVG → VectorDrawable]
-    S -->|自动入库| R
-
-    O -->|Telegram API| T[手机通知]
-    O -->|gh pr create| U[GitHub PR]
+    P --> Q[Telegram / GitHub]
 ```
 
 ---
@@ -65,22 +68,28 @@ graph TD
 stateDiagram-v2
     [*] --> pending: 用户提交
     pending --> planning: Executor dequeue
-    planning --> debating: 启动三方辩论
-    debating --> consensus: 三方输出汇总
-    consensus --> waiting_gate: L2 任务
-    consensus --> coding: L0/L1 任务
-    waiting_gate --> coding: /continue
+    planning --> waiting_clarification: 需求不明确
+    planning --> debating: 需求明确
+    waiting_clarification --> pending: /reply 用户澄清
+    waiting_clarification --> cancelled: 超时 48h
+    debating --> consensus: 三方汇总
+    consensus --> waiting_gate: L2
+    consensus --> coding: L0/L1
+    waiting_gate --> pending: /continue 续跑编码
     waiting_gate --> cancelled: 超时 24h
     coding --> building: Claude 写完
-    building --> git_committing: 全绿
-    building --> correcting: 失败
+    building --> codex_review: Gradle 全绿
+    building --> correcting: 编译失败
+    codex_review --> git_committing: 审查 PASS
+    codex_review --> correcting: 逻辑/回归 FAIL
     correcting --> coding: fix prompt
-    correcting --> failed: 超 3 次
-    git_committing --> creating_pr: push
-    creating_pr --> notifying: PR 创建
+    correcting --> failed: 超次数
+    git_committing --> creating_pr
+    creating_pr --> notifying
     notifying --> completed
-    failed --> notifying
 ```
+
+持久化：`orchestrator/state_machine.py` + `data/agent.db`（WAL）。非法流转会拒绝并打日志。
 
 ---
 
@@ -88,42 +97,41 @@ stateDiagram-v2
 
 ```
 AICodeAgent/
-├── README.md                        # 本文件
-├── ARCHITECTURE_v3.md               # V3 详细架构蓝图
-├── IMPLEMENTATION_v2.md             # V2 源码参考（供回溯）
-├── setup.md                         # 环境搭建指南
+├── README.md
+├── ARCHITECTURE_v3.md          # 详细蓝图
+├── setup.md
+├── start.sh / stop.sh          # 一键启停
 │
 ├── gateway/
-│   ├── web_ui_v2.py                 # Web UI 网关 (SQLite + 动态站点)
-│   └── telegram_bot_v2.py           # Telegram Bot (SQLite + L2 持久化)
+│   ├── web_ui_v2.py            # Web + /api/trigger|continue|reply|cancel
+│   └── telegram_bot_v2.py      # /task /reply /continue /cancel
 │
 ├── orchestrator/
-│   ├── executor.py                  # 串行任务执行器 + 文件锁
-│   ├── orchestrator.py              # 核心编排器 (含 Multi-Agent Debate)
-│   ├── state_machine.py             # LangGraph 状态机 + SQLite
-│   └── CLAUDE_HEADLESS.md           # V3 完全自主契约
+│   ├── executor.py             # 串行队列 + 超时清理
+│   ├── orchestrator.py           # 主编排（辩论/编码/PR）
+│   ├── state_machine.py          # 状态机 + SQLite
+│   ├── codex_review.py           # 构建后逻辑/回归审查
+│   ├── graph_bridge.py           # CRG 语义检索 / 影响面
+│   ├── asset_manager.py          # Figma 资产与 asset_map
+│   ├── platform_figma.py         # platform-figma-list 站点解析
+│   └── CLAUDE_HEADLESS.md        # Claude 编码契约
 │
 ├── scripts/
-│   ├── build_monitor.sh             # Gradle 超时监控
-│   ├── course_correct.py            # 统一错误解析器
-│   ├── notify.sh                    # Telegram 通知
-│   └── figma_fetch.sh               # Figma 设计稿拉取
+│   ├── figma_fetch.sh
+│   ├── build_monitor.sh
+│   └── ...
 │
-└── workspace/                       # 运行时创建 (每个任务独立沙箱)
-    └── {task_id}/
-        ├── claude_context.md        # 任务上下文 (规范 + RAG + Consensus)
-        ├── consensus.md             # 辩论共识方案
-        ├── architect_proposal.md    # Agent A 原始输出
-        ├── architect_proposal_output.md
-        ├── figma_audit.md           # Agent B 原始输入
-        ├── figma_audit_output.md    # Agent B 原始输出
-        ├── guardian_review.md       # Agent C 原始输入
-        ├── guardian_review_output.md # Agent C 原始输出
-        ├── asset_map.json           # 视觉资产自动映射表
-        ├── intent.md / design.md / plan.md
-        ├── figma/                   # 经过去重后的新资产
-        └── build.log                # Gradle 构建日志
+├── data/                         # 运行时（gitignore）
+└── workspace/{task_id}/          # 任务沙箱（gitignore）
+    ├── clarification_questions.md
+    ├── user_clarification.md
+    ├── consensus.md
+    ├── codex_review.md
+    ├── asset_map.json
+    └── ...
 ```
+
+**部署位置**：本目录默认在 Android 工程根目录下（`wm/AICodeAgent/`），`PROJECT_ROOT` 指向上一级；`start.sh` 依赖该布局。
 
 ---
 
@@ -132,95 +140,144 @@ AICodeAgent/
 ### 1. 环境依赖
 
 ```bash
-# Python 3.9+
-pip3 install requests
+pip3 install requests   # Telegram 通知等
 
-# GitHub CLI
 brew install gh
 gh auth login
 
-# Claude Code CLI
 npm install -g @anthropic-ai/claude-code
+# 可选：安装 OpenAI Codex CLI 并设置 CODEX_CMD
 ```
 
 ### 2. 环境变量
 
 ```bash
-# V2 保留
-export CLAUDE_CODE_AUTO_ALLOW_BASH=true
+# 必选（构建）
 export ANDROID_HOME=$HOME/Library/Android/sdk
 export JAVA_HOME=/Applications/Android\ Studio.app/Contents/jbr/Contents/Home
+export CLAUDE_CODE_AUTO_ALLOW_BASH=true
+
+# 通知（可选）
 export TELEGRAM_BOT_TOKEN=...
 export TELEGRAM_CHAT_ID=...
 
-# V3 新增
-export FIGMA_TOKEN=figma_personal_access_token
-# FIGMA_FILE_KEY 可选；提交任务时填 site_hint（enName 或中文简称）即可从 platform-figma-list 解析
+# Web API 认证（建议生产设置）
+export AGENT_API_KEY=your-secret
+
+# Figma（UI 类任务）
+export FIGMA_TOKEN=...
+# site_hint 可从 platform-figma-list 解析，不必手填 FIGMA_FILE_KEY
+
+# 编排超时 / 重试
 export AGENT_DEBATE_TIMEOUT=600
 export AGENT_CONSENSUS_MAX_RETRY=2
+export CODEX_REVIEW_MAX_RETRY=2
+export AGENT_CLARIFICATION_TIMEOUT_HOURS=48
+export AGENT_TASK_TOTAL_TIMEOUT=7200
+
+# Codex 审查（可选；未设置则回退 claude --print 审查员）
+export CODEX_CMD=""                    # 例: codex exec -a never --
+export CODEX_REVIEW_TIMEOUT=900
+
+# 跳过需求反问（调试）
+# export AGENT_SKIP_CLARIFICATION=1
+
+# Code Review Graph（可选）
+export CRG_AUTO_START=1
+export CRG_HTTP_URL=http://127.0.0.1:5555
 ```
 
 ### 3. 启动
 
 ```bash
-# 1. 启动串行执行器（后台，核心引擎）
+# 推荐：在 Android 工程根目录
+./AICodeAgent/start.sh
+
+# 或手动
 python3 AICodeAgent/orchestrator/executor.py &
-
-# 2. 启动 Web UI 网关
 python3 AICodeAgent/gateway/web_ui_v2.py
-
-# 3. 或启动 Telegram Bot
 python3 AICodeAgent/gateway/telegram_bot_v2.py
 ```
 
-### 4. 提交测试任务
+### 4. 提交任务
+
+**Web**（需 `Authorization: Bearer $AGENT_API_KEY` 若已配置）：
 
 ```bash
-# L0 轻量任务测试
 curl -X POST http://localhost:6789/api/trigger \
   -H "Content-Type: application/json" \
-  -d '{"raw_requirement":"在 strings.xml 里加 clear_cache 字符串","level":"L0"}'
+  -H "Authorization: Bearer $AGENT_API_KEY" \
+  -d '{"raw_requirement":"在 strings.xml 增加 clear_cache","level":"L0"}'
 
-# L1 常规任务（触发 Multi-Agent Debate）
-curl -X POST http://localhost:6789/api/trigger \
+# 需求澄清后
+curl -X POST http://localhost:6789/api/reply \
   -H "Content-Type: application/json" \
-  -d '{"raw_requirement":"在 SettingsScreen 添加清除缓存 M3 Confirm Dialog","level":"L1","site_hint":"haobo"}'
+  -H "Authorization: Bearer $AGENT_API_KEY" \
+  -d '{"task_id":"abc12345","reply":"目标站点 haobo，改 SettingsScreen 清除缓存按钮"}'
+
+# L2 共识后核准
+curl -X POST http://localhost:6789/api/continue \
+  -H "Authorization: Bearer $AGENT_API_KEY" \
+  -d '{"task_id":"abc12345"}'
+```
+
+**Telegram**：
+
+```text
+/task L1 haobo 在设置页加清除缓存
+/reply <task_id> 目标页面是 SettingsScreen，仅 haobo 站点
+/continue <task_id>          # L2 核准
+/status <task_id>
+/cancel <task_id>
 ```
 
 ---
 
-## 关键设计决策
+## 任务等级
 
-1. **Multi-Agent Debate**：Architect + FigmaAuditor + Guardian 三方辩论，Consensus Agent 仲裁，零人类参与决策。
-2. **完全自主 (No-Ask)**：Claude 禁止向人类提问，歧义时交叉引用现有代码做最专业假设。
-3. **RAG 动态上下文**：自动检索项目最近修改的 Compose Screen / ViewModel 作为 Few-Shot 示例。
-4. **视觉资产自动管理**：Figma 节点嗅探 → 本地哈希去重 → SVG 转 VectorDrawable → 自动命名入库。
-5. **串行执行**：文件锁 + SQLite 队列，避免多 Claude 操作同一 git working tree。
-6. **工作区隔离**：每个任务独立 `workspace/{task_id}/`， debates 原始输出永久保留用于审计。
+| 等级 | 流程摘要 |
+|------|----------|
+| **L0** | Planning →（澄清?）→ **跳过辩论** → 编码 → 构建 → Codex → PR |
+| **L1** | Planning →（澄清?）→ 辩论 → 共识 → 编码 → … |
+| **L2** | 同 L1，共识后 **waiting_gate**，人工 `/continue` 后续跑 |
+| **auto** | 按需求文本自动判定 L0/L1/L2 |
 
 ---
 
-## 与现有开发协议对接
+## 关键设计
 
-| 协议组件 | V3 对接方式 |
-|---------|-----------|
-| 递归式协议 6 阶段 | Debate + Consensus 自动走完前 4 阶段，L2 在 `waiting_gate` 暂停 |
-| `doc/tasks/{name}/` | Orchestrator 生成到 `workspace/{task_id}/` |
-| `CLAUDE.md` | 不再覆盖根目录，任务上下文写入 `workspace/{task_id}/claude_context.md` |
-| `AGENTS.md` | 规范融入 `CLAUDE_HEADLESS.md`，Guardian 负责强制执行 |
-| `.skills/recursive-dev-protocol` | 等级判定逻辑复用，Debate 后可能调整等级 |
-| `get_impact_radius` MCP | Architect Agent 编码前自动调用 |
+1. **先澄清再辩论**：Intake Agent 用 `claude --print` 输出 JSON；不明确则写 `clarification_questions.md` 并通知用户。
+2. **构建与审查分离**：Claude 不跑 Gradle；全绿后 **Codex 阶段** 专查逻辑漏洞与对其他 case/站点的影响（结合 `get_impact_summary`）。
+3. **续跑标志**：`resume_from_gate`（L2）、`resume_after_clarification`（澄清后）— 任务回到 `pending` 由 Executor 再次 `process_task`。
+4. **安全边界**：`apply_code_changes` 黑名单（`jg_tools/`、`Configs.kt`、keystore 等）；任务结束恢复 `Configs.kt` 与 git 工作区。
+5. **串行执行**：单 Executor + 文件锁，避免多任务同时改同一 git tree。
+
+---
+
+## 与 wm 开发协议
+
+| 组件 | 对接 |
+|------|------|
+| `doc/dev_protocol_android.md` 九阶段 | 辩论≈设计阶段；L2 `waiting_gate`≈人工核准；**非**全流程自动 `[继续执行]` |
+| `doc/tasks/{name}/` | 任务产物在 `workspace/{task_id}/` |
+| `SiteRules` / 多站点 | Guardian + Codex 审查 enName 比较规范 |
+| code-review-graph | `graph_bridge.py`，`start.sh` 可 `CRG_AUTO_START=1` |
 
 ---
 
 ## 扩展计划
 
-- [x] Visual Asset Manager（哈希去重 + SVG→VectorDrawable + `asset_map.json`）
-- [x] Code Review Graph 桥接（`graph_bridge.py`，可选 `CRG_AUTO_START=1`）
-- [x] Debate 并行 + 超时
-- [x] L2 `/continue` 续跑编码阶段
-- [ ] Maestro 流程测试集成
-- [ ] Paparazzi 截图回归（对比 Figma 基线）
+- [x] Visual Asset Manager + `asset_map.json`
+- [x] Code Review Graph 桥接（`graph_bridge.py`）
+- [x] L2 `/continue` 续跑编码
+- [x] 需求澄清门（`waiting_clarification` + `/reply`）
+- [x] 构建后 Codex 逻辑审查（`codex_review.py`）
+- [ ] Maestro 流程测试
+- [ ] Paparazzi + Figma 基线对比
 - [ ] 多站点并行 PR
-- [ ] 企业微信/钉钉通知适配
-- [ ] 向量数据库 RAG（替代当前关键词 + 图谱混合检索）
+- [ ] 企业微信/钉钉通知
+- [ ] 向量 RAG（替代关键词检索）
+
+---
+
+详细设计见 [ARCHITECTURE_v3.md](./ARCHITECTURE_v3.md)，环境见 [setup.md](./setup.md)。
