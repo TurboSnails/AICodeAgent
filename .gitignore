@@ -1,0 +1,13 @@
+# 运行时数据
+data/
+workspace/
+*.db
+*.lock
+
+# Python
+__pycache__/
+*.pyc
+.Python
+
+# 日志
+*.log
