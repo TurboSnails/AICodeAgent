@@ -178,17 +178,22 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> pending: 用户提交
     pending --> planning: Executor dequeue
-    planning --> debating: 启动三方辩论
+    planning --> waiting_clarification: 需求不明确
+    planning --> debating: 需求明确
+    waiting_clarification --> pending: /reply 用户澄清
+    waiting_clarification --> cancelled: 超时 48h
     debating --> consensus: 三方输出汇总
     consensus --> waiting_gate: L2 任务
     consensus --> coding: L0/L1 任务
-    waiting_gate --> coding: /continue
+    waiting_gate --> pending: /continue 续跑编码
     waiting_gate --> cancelled: 超时 24h
     coding --> building: Claude 写完
-    building --> git_committing: 全绿
-    building --> correcting: 失败
+    building --> codex_review: Gradle 全绿
+    building --> correcting: 编译失败
+    codex_review --> git_committing: Codex PASS
+    codex_review --> correcting: 逻辑/回归 FAIL
     correcting --> coding: fix prompt
-    correcting --> failed: 超 3 次
+    correcting --> failed: 超次数
     git_committing --> creating_pr: push
     creating_pr --> notifying: PR 创建
     notifying --> completed
@@ -204,6 +209,12 @@ stateDiagram-v2
 | `consensus_done` | `consensus` | `coding` | L0/L1 共识方案确认 |
 | `consensus_done_l2` | `consensus` | `waiting_gate` | L2 共识方案需人工核准 |
 | `debate_timeout` | `debating` | `correcting` | 10 分钟超时 |
+| `intake_clarify` | `planning` | `waiting_clarification` | Intake Agent 判定需求不明确 |
+| `clarify_done` | `waiting_clarification` | `pending` | 用户 `/reply` 或 Web `/api/reply` |
+| `codex_pass` | `codex_review` | `git_committing` | Codex/Claude 逻辑审查通过 |
+| `codex_fail` | `codex_review` | `correcting` | 逻辑漏洞或回归风险，回到编码修复 |
+
+**Codex 审查**：构建全绿后调用 `codex_review.py`（优先 `CODEX_CMD` / `codex` CLI，否则 `claude --print` 审查员 persona）。结合 `graph_bridge.get_impact_summary` 评估对其他 case 的影响。报告写入 `workspace/{id}/codex_review.md`。
 
 ---
 

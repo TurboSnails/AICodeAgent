@@ -17,11 +17,13 @@ DB_FILE = Path(__file__).resolve().parents[1] / "data" / "agent.db"
 class State(Enum):
     PENDING = "pending"
     PLANNING = "planning"
+    WAITING_CLARIFICATION = "waiting_clarification"
     DEBATING = "debating"
     CONSENSUS = "consensus"
     WAITING_GATE = "waiting_gate"
     CODING = "coding"
     BUILDING = "building"
+    CODEX_REVIEW = "codex_review"
     CORRECTING = "correcting"
     GIT_COMMITTING = "git_committing"
     CREATING_PR = "creating_pr"
@@ -33,12 +35,14 @@ class State(Enum):
 
 VALID_TRANSITIONS = {
     State.PENDING: [State.PLANNING, State.CANCELLED],
-    State.PLANNING: [State.DEBATING, State.CODING, State.CANCELLED],
+    State.PLANNING: [State.DEBATING, State.CODING, State.WAITING_CLARIFICATION, State.CANCELLED],
+    State.WAITING_CLARIFICATION: [State.PENDING, State.CANCELLED],
     State.DEBATING: [State.CONSENSUS, State.CORRECTING, State.CANCELLED],
     State.CONSENSUS: [State.WAITING_GATE, State.CODING, State.CANCELLED],
     State.WAITING_GATE: [State.CODING, State.CANCELLED, State.PENDING],
     State.CODING: [State.BUILDING, State.CANCELLED],
-    State.BUILDING: [State.GIT_COMMITTING, State.CORRECTING, State.CANCELLED],
+    State.BUILDING: [State.CODEX_REVIEW, State.CORRECTING, State.CANCELLED],
+    State.CODEX_REVIEW: [State.GIT_COMMITTING, State.CORRECTING, State.CANCELLED],
     State.CORRECTING: [State.CODING, State.FAILED, State.CANCELLED],
     State.GIT_COMMITTING: [State.CREATING_PR, State.CANCELLED],
     State.CREATING_PR: [State.NOTIFYING, State.CANCELLED],
@@ -66,6 +70,8 @@ class Task:
     updated_at: str = ""
     gate_deadline: str = ""
     resume_from_gate: int = 0
+    clarification_deadline: str = ""
+    resume_after_clarification: int = 0
 
 
 def _connect() -> sqlite3.Connection:
@@ -78,10 +84,14 @@ def _connect() -> sqlite3.Connection:
 
 
 def _migrate_schema(conn: sqlite3.Connection):
-    """向后兼容：为旧库补充 resume_from_gate 列"""
+    """向后兼容：为旧库补充新列"""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(task_queue)").fetchall()}
     if "resume_from_gate" not in cols:
         conn.execute("ALTER TABLE task_queue ADD COLUMN resume_from_gate INTEGER DEFAULT 0")
+    if "clarification_deadline" not in cols:
+        conn.execute("ALTER TABLE task_queue ADD COLUMN clarification_deadline TEXT DEFAULT ''")
+    if "resume_after_clarification" not in cols:
+        conn.execute("ALTER TABLE task_queue ADD COLUMN resume_after_clarification INTEGER DEFAULT 0")
 
 
 def init_db():
@@ -136,14 +146,17 @@ def save_task(task: Task) -> Task:
         INSERT OR REPLACE INTO task_queue
         (task_id, raw_requirement, level, site_hint, source, chat_id, status,
          current_state, attempt_count, max_retries, pr_url, branch, base_branch,
-         error_log, created_at, updated_at, gate_deadline, resume_from_gate)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         error_log, created_at, updated_at, gate_deadline, resume_from_gate,
+         clarification_deadline, resume_after_clarification)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         task.task_id, task.raw_requirement, task.level, task.site_hint,
         task.source, task.chat_id, task.status, task.current_state,
         task.attempt_count, task.max_retries, task.pr_url, task.branch,
         task.base_branch, task.error_log, task.created_at, task.updated_at,
         task.gate_deadline, int(task.resume_from_gate or 0),
+        task.clarification_deadline or "",
+        int(task.resume_after_clarification or 0),
     ))
     conn.commit()
     conn.close()
@@ -211,13 +224,13 @@ def get_pending_tasks(limit: int = 10) -> list[Task]:
 
 
 def get_executable_tasks(limit: int = 10) -> list[Task]:
-    """待执行队列：新任务 pending，或 L2 核准后 resume_from_gate=1 的 pending"""
+    """待执行队列：新任务 pending；或 L2 / 澄清 核准后带 resume 标志的 pending"""
     conn = _connect()
     cursor = conn.execute(
         """
         SELECT * FROM task_queue
         WHERE current_state = ?
-        ORDER BY resume_from_gate ASC, created_at ASC
+        ORDER BY resume_from_gate DESC, resume_after_clarification DESC, created_at ASC
         LIMIT ?
         """,
         (State.PENDING.value, limit),
@@ -310,6 +323,66 @@ def get_waiting_gates() -> list[Task]:
     return [_row_to_task(r) for r in rows]
 
 
+def get_waiting_clarifications() -> list[Task]:
+    conn = _connect()
+    cursor = conn.execute(
+        "SELECT * FROM task_queue WHERE current_state = ?",
+        (State.WAITING_CLARIFICATION.value,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [_row_to_task(r) for r in rows]
+
+
+def approve_clarification_reply(task_id: str, user_reply: str) -> bool:
+    """用户澄清后回到 pending，Executor 从辩论前续跑（跳过 intake）"""
+    reply = (user_reply or "").strip()
+    if not reply:
+        return False
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM task_queue WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            conn.execute("ROLLBACK")
+            conn.close()
+            return False
+
+        task = _row_to_task(row)
+        if task.current_state != State.WAITING_CLARIFICATION.value:
+            conn.execute("ROLLBACK")
+            conn.close()
+            return False
+
+        merged_req = task.raw_requirement.rstrip() + "\n\n[用户澄清]\n" + reply
+        from_state = task.current_state
+        now = datetime.now().isoformat()
+        conn.execute(
+            """
+            UPDATE task_queue
+            SET current_state = ?, raw_requirement = ?, resume_after_clarification = ?,
+                clarification_deadline = ?, updated_at = ?
+            WHERE task_id = ?
+            """,
+            (State.PENDING.value, merged_req, 1, "", now, task_id),
+        )
+        conn.execute(
+            "INSERT INTO state_history (task_id, from_state, to_state, reason, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (task_id, from_state, State.PENDING.value, "user clarification received", now),
+        )
+        conn.commit()
+        print(f"[STATE] {task_id}: {from_state} -> pending (resume_after_clarification=1)")
+        return True
+    except sqlite3.OperationalError as e:
+        print(f"[STATE ERROR] SQLite operational error: {e}")
+        conn.execute("ROLLBACK")
+        return False
+    finally:
+        conn.close()
+
+
 def cancel_task(task_id: str, reason: str = "user cancelled") -> bool:
     """取消任务：从任意非终态强制流转到 CANCELLED，无需经过常规 transition 校验"""
     terminal = {State.COMPLETED.value, State.FAILED.value, State.CANCELLED.value}
@@ -372,6 +445,8 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         updated_at=row["updated_at"] or "",
         gate_deadline=row["gate_deadline"] or "",
         resume_from_gate=row["resume_from_gate"] or 0,
+        clarification_deadline=row["clarification_deadline"] if "clarification_deadline" in row.keys() else "",
+        resume_after_clarification=row["resume_after_clarification"] if "resume_after_clarification" in row.keys() else 0,
     )
 
 

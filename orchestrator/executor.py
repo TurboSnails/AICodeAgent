@@ -14,7 +14,10 @@ import sys
 import time
 from pathlib import Path
 
-from state_machine import init_db, get_executable_tasks, get_waiting_gates, transition, State
+from state_machine import (
+    init_db, get_executable_tasks, get_waiting_gates, get_waiting_clarifications,
+    transition, State,
+)
 from orchestrator import process_task
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -143,6 +146,9 @@ def run_loop():
                 for gate in gates:
                     if gate.gate_deadline and datetime.fromisoformat(gate.gate_deadline) < datetime.now():
                         transition(gate.task_id, State.CANCELLED, "L2 gate timeout 24h")
+                for clar in get_waiting_clarifications():
+                    if clar.clarification_deadline and datetime.fromisoformat(clar.clarification_deadline) < datetime.now():
+                        transition(clar.task_id, State.CANCELLED, "clarification timeout")
                 time.sleep(5)
                 continue
             task = tasks[0]

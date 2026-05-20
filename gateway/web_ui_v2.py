@@ -24,7 +24,10 @@ DB_FILE = PROJECT_ROOT / "AICodeAgent" / "data" / "agent.db"
 PORT = 6789
 
 sys.path.insert(0, str(PROJECT_ROOT / "AICodeAgent" / "orchestrator"))
-from state_machine import init_db, save_task, Task, get_task, approve_gate_resume, cancel_task, State
+from state_machine import (
+    init_db, save_task, Task, get_task, approve_gate_resume, approve_clarification_reply,
+    cancel_task, State,
+)
 from platform_figma import list_platform_sites_for_ui
 
 API_TOKEN = os.environ.get("AGENT_API_KEY", "").strip()
@@ -91,6 +94,10 @@ INDEX_HTML = """<!DOCTYPE html>
   <div id="gateList">加载中...</div>
 </div>
 <div class="card">
+  <h2>待澄清需求</h2>
+  <div id="clarifyList">加载中...</div>
+</div>
+<div class="card">
   <h2>任务历史</h2>
   <div id="taskList">加载中...</div>
 </div>
@@ -133,6 +140,33 @@ async function refreshGates() {
       <button class="btn-sm btn-cancel" onclick="cancelTask('${t.task_id}')">❌ 取消</button>
     </div>`
   ).join('');
+}
+async function refreshClarifications() {
+  const res = await fetch('/api/waiting_clarifications');
+  const data = await res.json();
+  const container = document.getElementById('clarifyList');
+  if (!data.items || data.items.length === 0) { container.innerHTML = '<p style="color:#94a3b8">暂无待澄清任务</p>'; return; }
+  container.innerHTML = data.items.map(t =>
+    `<div class="task-item gate-card">
+      <div><strong>${t.raw_requirement.substring(0,60)}...</strong></div>
+      <div class="meta">ID: ${t.task_id} | ${t.level}</div>
+      <textarea id="reply-${t.task_id}" placeholder="补充澄清内容..." style="min-height:60px;margin-top:8px;"></textarea>
+      <button class="btn-sm btn-continue" onclick="replyClarify('${t.task_id}')">提交澄清</button>
+      <button class="btn-sm btn-cancel" onclick="cancelTask('${t.task_id}')">取消</button>
+    </div>`
+  ).join('');
+}
+async function replyClarify(tid) {
+  const text = document.getElementById('reply-' + tid).value.trim();
+  if (!text) { alert('请填写澄清内容'); return; }
+  const res = await fetch('/api/reply', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + getToken() },
+    body: JSON.stringify({ task_id: tid, reply: text })
+  });
+  const data = await res.json();
+  alert(data.message);
+  refreshClarifications();
+  refreshTasks();
 }
 async function continueTask(tid) {
   const res = await fetch('/api/continue', {
@@ -178,8 +212,10 @@ document.getElementById('taskForm').addEventListener('submit', async (e) => {
 loadSites();
 refreshTasks();
 refreshGates();
+refreshClarifications();
 setInterval(refreshTasks, 5000);
 setInterval(refreshGates, 5000);
+setInterval(refreshClarifications, 5000);
 </script>
 </body>
 </html>
@@ -282,6 +318,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                       "current_state": r[4], "pr_url": r[5] or "", "created_at": r[6]} for r in rows]
             self._json({"gates": gates})
             return
+        elif path == "/api/waiting_clarifications":
+            conn = sqlite3.connect(str(DB_FILE))
+            cursor = conn.execute(
+                "SELECT task_id, raw_requirement, level, site_hint, current_state, created_at FROM task_queue WHERE current_state = ? ORDER BY created_at DESC",
+                (State.WAITING_CLARIFICATION.value,),
+            )
+            rows = cursor.fetchall()
+            conn.close()
+            items = [{"task_id": r[0], "raw_requirement": r[1], "level": r[2], "site_hint": r[3],
+                      "current_state": r[4], "created_at": r[5]} for r in rows]
+            self._json({"items": items})
+            return
         elif path == "/health":
             # 健康检查：统计各状态任务数
             import sqlite3
@@ -350,6 +398,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"ok": True, "message": f"L2 已核准，任务 {tid} 已重新入队"})
             else:
                 self._json({"ok": False, "message": "核准失败"}, 500)
+            return
+        if path == "/api/reply":
+            if not self._check_auth():
+                return
+            try:
+                payload = json.loads(body) if body else {}
+            except Exception:
+                self._json({"ok": False, "message": "invalid json"}, 400)
+                return
+            tid = (payload.get("task_id") or "").strip()
+            reply = (payload.get("reply") or "").strip()
+            if not tid or not reply:
+                self._json({"ok": False, "message": "task_id 与 reply 必填"}, 400)
+                return
+            task = get_task(tid)
+            if not task or task.current_state != State.WAITING_CLARIFICATION.value:
+                self._json({"ok": False, "message": f"任务 {tid} 不在 waiting_clarification"}, 400)
+                return
+            if approve_clarification_reply(tid, reply):
+                ws = PROJECT_ROOT / "AICodeAgent" / "workspace" / tid
+                ws.mkdir(parents=True, exist_ok=True)
+                (ws / "user_clarification.md").write_text(reply, encoding="utf-8")
+                self._json({"ok": True, "message": f"澄清已记录，任务 {tid} 将重新入队"})
+            else:
+                self._json({"ok": False, "message": "澄清提交失败"}, 500)
             return
         if path == "/api/cancel":
             if not self._check_auth():

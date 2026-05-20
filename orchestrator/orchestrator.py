@@ -4,6 +4,8 @@ Headless Orchestrator V3
 - Multi-Agent Debate + Consensus
 - Code-First asset_analysis 在辩论前注入
 - L2 gate 核准后 resume_from_gate 续跑编码阶段
+- Planning 后需求不明确 → waiting_clarification，用户 /reply 后再三方辩论
+- Building 全绿后 codex_review（逻辑/漏洞/回归），FAIL → correcting 修复
 - Claude --print 只写代码；Orchestrator 跑 Gradle / git / PR
 """
 
@@ -24,6 +26,7 @@ from typing import Optional  # noqa: F401 — used in resolve_task_platform_site
 from state_machine import Task, transition, State, save_task, get_task, approve_gate_resume
 from asset_manager import process_visual_assets
 from graph_bridge import build_architect_graph_context, semantic_search_files
+from codex_review import run_codex_review
 from platform_figma import PlatformSiteResolved, resolve_site_hint, write_platform_site_meta
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +38,8 @@ CLAUDE_TIMEOUT = 30 * 60
 DEBATE_TIMEOUT = int(os.environ.get("AGENT_DEBATE_TIMEOUT", "600"))
 AGENT_TIMEOUT = int(os.environ.get("AGENT_SINGLE_TIMEOUT", "300"))
 CONSENSUS_MAX_RETRY = int(os.environ.get("AGENT_CONSENSUS_MAX_RETRY", "2"))
+CODEX_REVIEW_MAX_RETRY = int(os.environ.get("CODEX_REVIEW_MAX_RETRY", "2"))
+CLARIFICATION_TIMEOUT_HOURS = int(os.environ.get("AGENT_CLARIFICATION_TIMEOUT_HOURS", "48"))
 FIGMA_FETCH_SCRIPT = PROJECT_ROOT / "AICodeAgent" / "scripts" / "figma_fetch.sh"
 
 FILE_MARKER = re.compile(r"===\s*FILE:\s*(.+?)\s*===")
@@ -826,6 +831,127 @@ def parse_gradle_errors(log: str) -> str:
     return "\n".join(log.splitlines()[-30:])
 
 
+def build_codex_fix_prompt(requirement: str, review_report: str, attempt: int) -> str:
+    return f"""
+Codex 逻辑审查未通过（第 {attempt} 次修复）
+
+原始需求: {requirement}
+
+审查报告（必须逐条修复 Logic issues / Regression risks / Suggested fixes）:
+{review_report[:6000]}
+
+修复规则:
+1. 仅修改与需求和审查意见直接相关的文件
+2. 修复逻辑漏洞与回归风险，不要破坏其他站点/既有 case
+3. site enName 比较必须使用 TextUtils.equals()
+4. UIState 保持不可变 data class
+5. 不要运行 Gradle 或 git
+6. 不要引入新的第三方依赖
+
+请输出修复后的代码，使用 === FILE: path === 格式。
+"""
+
+
+def _parse_intake_json(claude_output: str) -> dict:
+    m = re.search(r"```json\s*(\{.*?\})\s*```", claude_output, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    m = re.search(r"\{[^{}]*\"needs_clarification\"[^{}]*\}", claude_output, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def assess_requirement_clarity(task: Task, workspace: Path) -> tuple[bool, list[str], str]:
+    """需求 intake：不明确则返回 (True, questions, reason)"""
+    if os.environ.get("AGENT_SKIP_CLARIFICATION", "0") == "1":
+        return False, [], "skip by env"
+    # 用户已澄清续跑
+    if task.resume_after_clarification:
+        return False, [], "already clarified"
+
+    ctx = build_context_file(task, workspace)
+    prompt = f"""
+你是需求分析员。判断以下 Android 多站点需求是否**足够明确**，可进入 Architect/Figma/QA 三方技术辩论。
+
+需求:
+{task.raw_requirement}
+
+等级: {task.level} | 站点 hint: {task.site_hint or "未指定"}
+
+若缺少以下任一类信息，必须反问用户（needs_clarification=true）:
+- 目标页面/模块或文件路径
+- 目标站点（enName）或是否全站
+- 验收标准 / 交互细节
+- 是否涉及 Figma/主题/资源
+- 与既有功能的边界（改什么不改什么）
+
+若需求已是 L0 级明确小改（如「在 xxx strings.xml 增加 key foo」）且信息完备，可 needs_clarification=false。
+
+严格输出 JSON（可包在 ```json 代码块内）:
+{{"needs_clarification": true|false, "questions": ["问题1","问题2"], "reason": "一句话"}}
+最多 5 个问题。
+"""
+    out = claude_code_print(prompt, ctx, timeout=120)
+    data = _parse_intake_json(out)
+    needs = bool(data.get("needs_clarification"))
+    questions = [str(q).strip() for q in (data.get("questions") or []) if str(q).strip()]
+    reason = str(data.get("reason") or "")
+    if needs and not questions:
+        questions = ["请补充目标页面/站点与验收标准。"]
+    return needs, questions[:5], reason
+
+
+def maybe_wait_for_clarification(task: Task, workspace: Path) -> bool:
+    """若需用户澄清则进入 waiting_clarification 并返回 True（调用方应 return）"""
+    needs, questions, reason = assess_requirement_clarity(task, workspace)
+    if not needs:
+        return False
+
+    lines = [f"# 需求澄清\n\n原因: {reason}\n", "## 待用户回答\n"]
+    for i, q in enumerate(questions, 1):
+        lines.append(f"{i}. {q}\n")
+    (workspace / "clarification_questions.md").write_text("".join(lines), encoding="utf-8")
+
+    task.clarification_deadline = (
+        datetime.now() + timedelta(hours=CLARIFICATION_TIMEOUT_HOURS)
+    ).isoformat()
+    save_task(task)
+    transition(task.task_id, State.WAITING_CLARIFICATION, "requirement ambiguous")
+    _notify_clarification(task, questions)
+    return True
+
+
+def _notify_clarification(task: Task, questions: list[str]):
+    chat_id = task.chat_id or os.environ.get("TELEGRAM_CHAT_ID")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    qs = "\n".join(f"• {q}" for q in questions)
+    msg = (
+        f"<b>需求待澄清</b>\n任务ID: <code>{task.task_id}</code>\n"
+        f"需求: {task.raw_requirement[:100]}\n\n{qs}\n\n"
+        f"请回复: <code>/reply {task.task_id} 你的回答</code>\n"
+        f"或 Web POST /api/reply"
+    )
+    if chat_id and token:
+        try:
+            import requests
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+                timeout=10,
+            )
+            return
+        except Exception as e:
+            print(f"[TELEGRAM clarify] {e}")
+    print(f"[CLARIFY NOTIFY] {msg}")
+
+
 def build_fix_prompt(requirement: str, errors: str, attempt: int) -> str:
     return f"""
 构建/测试失败（第 {attempt} 次重试）
@@ -1489,7 +1615,11 @@ def run_coding_build_pr(task: Task, ws: Path):
 请直接输出代码。
 """
 
-    for attempt in range(task.max_retries + 1):
+    build_passed = False
+    attempt = 0
+    codex_round = 0
+
+    while attempt <= task.max_retries:
         transition(task.task_id, State.CODING, f"attempt {attempt + 1}")
         claude_output = claude_code_print(initial_prompt, context_file)
 
@@ -1501,6 +1631,7 @@ def run_coding_build_pr(task: Task, ws: Path):
                 write_unrecoverable_error(ws, task.raw_requirement, task.error_log)
                 notify_telegram(task)
                 return
+            attempt += 1
             continue
 
         applied = apply_code_changes(claude_output)
@@ -1509,25 +1640,58 @@ def run_coding_build_pr(task: Task, ws: Path):
         transition(task.task_id, State.BUILDING, f"attempt {attempt + 1}")
         exit_code, log = run_gradle_build(task)
 
-        if exit_code == 0:
-            print("[BUILD] All checks passed")
+        if exit_code != 0:
+            if attempt >= task.max_retries:
+                task.error_log = parse_gradle_errors(log)
+                save_task(task)
+                write_unrecoverable_error(ws, task.raw_requirement, task.error_log)
+                transition(task.task_id, State.FAILED, "max retries exceeded")
+                notify_telegram(task)
+                return
+            transition(task.task_id, State.CORRECTING, f"build fail attempt {attempt + 1}")
+            errors = parse_gradle_errors(log)
+            task.error_log = errors
+            save_task(task)
+            context_file = build_context_file(task, ws)
+            initial_prompt = build_fix_prompt(task.raw_requirement, errors, attempt + 2)
+            print(f"[CORRECT] Gradle retry {attempt + 2}")
+            attempt += 1
+            continue
+
+        print("[BUILD] All checks passed — starting Codex logic review")
+        transition(task.task_id, State.CODEX_REVIEW, f"codex round {codex_round + 1}")
+        passed, review_report = run_codex_review(
+            task.raw_requirement, ws, base_branch=task.base_branch or ""
+        )
+        (ws / "codex_review.md").write_text(review_report, encoding="utf-8")
+
+        if passed:
+            print("[CODEX] Review PASS")
+            build_passed = True
             break
 
-        if attempt >= task.max_retries:
-            task.error_log = parse_gradle_errors(log)
-            save_task(task)
+        codex_round += 1
+        print(f"[CODEX] Review FAIL (round {codex_round}/{CODEX_REVIEW_MAX_RETRY})")
+        task.error_log = review_report[:4000]
+        save_task(task)
+
+        if codex_round > CODEX_REVIEW_MAX_RETRY:
             write_unrecoverable_error(ws, task.raw_requirement, task.error_log)
-            transition(task.task_id, State.FAILED, "max retries exceeded")
+            transition(task.task_id, State.FAILED, "codex review max retries")
             notify_telegram(task)
             return
 
-        transition(task.task_id, State.CORRECTING, f"attempt {attempt + 1}")
-        errors = parse_gradle_errors(log)
-        task.error_log = errors
-        save_task(task)
+        transition(task.task_id, State.CORRECTING, f"codex fail round {codex_round}")
         context_file = build_context_file(task, ws)
-        initial_prompt = build_fix_prompt(task.raw_requirement, errors, attempt + 2)
-        print(f"[CORRECT] Retry {attempt + 2} with fix prompt")
+        initial_prompt = build_codex_fix_prompt(
+            task.raw_requirement, review_report, codex_round + 1
+        )
+        attempt += 1
+
+    if not build_passed:
+        transition(task.task_id, State.FAILED, "coding loop ended without success")
+        notify_telegram(task)
+        return
 
     # 编码后审计：对比 consensus 与实际修改
     deviation_report = _generate_consensus_deviation(ws, task)
@@ -1683,14 +1847,26 @@ def process_task(task: Task):
             run_coding_build_pr(task, ws)
             return
 
+        resume_clarified = bool(task.resume_after_clarification)
+        if resume_clarified:
+            print("[RESUME] User clarification received, skip intake")
+            task.resume_after_clarification = 0
+            save_task(task)
+
         if task.level == "auto":
             task.level = auto_level(task.raw_requirement)
             save_task(task)
 
-        generate_docs(task, ws)
+        if not resume_clarified or not (ws / "requirement.md").exists():
+            generate_docs(task, ws)
         transition(task.task_id, State.PLANNING, "docs generated")
 
-        prepare_asset_context(task, ws)
+        if not resume_clarified or not (ws / "asset_analysis.md").exists():
+            prepare_asset_context(task, ws)
+
+        # 需求不明确：先反问用户，再三方辩论（L0 同样可走澄清，除非已澄清续跑）
+        if not resume_clarified and maybe_wait_for_clarification(task, ws):
+            return
 
         # L0：跳过三方辩论，直接进入编码（节省 claude 调用）
         if task.level == "L0":

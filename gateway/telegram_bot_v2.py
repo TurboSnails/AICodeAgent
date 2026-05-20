@@ -26,7 +26,10 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 POLL_TIMEOUT = 30
 
 sys.path.insert(0, str(PROJECT_ROOT / "AICodeAgent" / "orchestrator"))
-from state_machine import init_db, save_task, get_task, Task, transition, State, approve_gate_resume, cancel_task
+from state_machine import (
+    init_db, save_task, get_task, Task, transition, State,
+    approve_gate_resume, approve_clarification_reply, cancel_task,
+)
 from platform_figma import resolve_platform_site
 
 
@@ -146,6 +149,23 @@ def handle_command(message):
         else:
             send_message(f"任务 {tid} 不存在或不处于 waiting_gate 状态", chat_id=chat_id)
 
+    elif cmd == "/reply":
+        parts = arg.split(None, 1)
+        if len(parts) < 2:
+            send_message("用法: /reply <task_id> <澄清内容>", chat_id=chat_id)
+            return
+        tid, reply_text = parts[0].strip(), parts[1].strip()
+        ws = PROJECT_ROOT / "AICodeAgent" / "workspace" / tid
+        if approve_clarification_reply(tid, reply_text):
+            ws.mkdir(parents=True, exist_ok=True)
+            (ws / "user_clarification.md").write_text(reply_text, encoding="utf-8")
+            send_message(
+                f"已收到澄清，任务 <code>{tid}</code> 将重新入队并进入三方辩论…",
+                chat_id=chat_id,
+            )
+        else:
+            send_message(f"任务 {tid} 不存在或不处于 waiting_clarification", chat_id=chat_id)
+
     elif cmd == "/cancel":
         tid = arg.strip()
         if not tid:
@@ -171,6 +191,7 @@ def handle_command(message):
             "/status <task_id> 查询状态\n"
             "/history 最近任务\n"
             "/continue <task_id> L2 核准\n"
+            "/reply <task_id> <澄清> 需求反问后回复\n"
             "/cancel <task_id> 取消任务\n"
             "/help 显示帮助",
             chat_id=chat_id
@@ -178,23 +199,31 @@ def handle_command(message):
 
 
 def restore_pending_gates():
-    """Bot 启动时恢复所有 waiting_gate 任务的通知"""
+    """Bot 启动时恢复 waiting_gate / waiting_clarification 任务通知"""
     conn = sqlite3.connect(str(DB_FILE))
-    cursor = conn.execute("SELECT task_id, raw_requirement, chat_id, gate_deadline FROM task_queue WHERE current_state = ?", (State.WAITING_GATE.value,))
-    rows = cursor.fetchall()
-    conn.close()
-    for row in rows:
-        tid, req, cid, deadline = row
-        if deadline and datetime.fromisoformat(deadline) < datetime.now():
-            transition(tid, State.CANCELLED, "gate timeout on bot restart")
-            send_message(f"任务 {tid} 已超时取消", chat_id=cid)
-            continue
-        send_message(
-            f"<b>Bot 已重启，L2 任务仍在等待核准</b>\n"
-            f"任务ID: <code>{tid}</code>\n"
-            f"请回复: <code>/continue {tid}</code>",
-            chat_id=cid
+    for state_val, hint_tpl in (
+        (State.WAITING_GATE.value, "/continue {tid}"),
+        (State.WAITING_CLARIFICATION.value, "/reply {tid} <你的回答>"),
+    ):
+        cursor = conn.execute(
+            "SELECT task_id, raw_requirement, chat_id, gate_deadline, clarification_deadline FROM task_queue WHERE current_state = ?",
+            (state_val,),
         )
+        rows = cursor.fetchall()
+        for row in rows:
+            tid, req, cid = row[0], row[1], row[2]
+            deadline = row[3] if state_val == State.WAITING_GATE.value else (row[4] if len(row) > 4 else "")
+            if deadline and datetime.fromisoformat(deadline) < datetime.now():
+                transition(tid, State.CANCELLED, "timeout on bot restart")
+                send_message(f"任务 {tid} 已超时取消", chat_id=cid)
+                continue
+            label = "L2 核准" if state_val == State.WAITING_GATE.value else "需求澄清"
+            send_message(
+                f"<b>Bot 已重启，{label}待处理</b>\n任务ID: <code>{tid}</code>\n"
+                f"请回复: <code>{hint_tpl.format(tid=tid)}</code>",
+                chat_id=cid,
+            )
+    conn.close()
 
 
 def poll_updates():
