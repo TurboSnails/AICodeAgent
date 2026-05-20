@@ -5,7 +5,7 @@ Headless Orchestrator V3
 - Code-First asset_analysis 在辩论前注入
 - L2 gate 核准后 resume_from_gate 续跑编码阶段
 - Planning 后需求不明确 → waiting_clarification，用户 /reply 后再三方辩论
-- Building 全绿后 codex_review（逻辑/漏洞/回归），FAIL → correcting 修复
+- Building 全绿 → codex_review（逻辑/回归）→ requirement_review（需求符合度/性能），FAIL → correcting
 - Claude --print 只写代码；Orchestrator 跑 Gradle / git / PR
 """
 
@@ -26,7 +26,7 @@ from typing import Optional  # noqa: F401 — used in resolve_task_platform_site
 from state_machine import Task, transition, State, save_task, get_task, approve_gate_resume
 from asset_manager import process_visual_assets
 from graph_bridge import build_architect_graph_context, semantic_search_files
-from codex_review import run_codex_review
+from codex_review import run_codex_review, run_requirement_acceptance_review
 from platform_figma import PlatformSiteResolved, resolve_site_hint, write_platform_site_meta
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -39,6 +39,7 @@ DEBATE_TIMEOUT = int(os.environ.get("AGENT_DEBATE_TIMEOUT", "600"))
 AGENT_TIMEOUT = int(os.environ.get("AGENT_SINGLE_TIMEOUT", "300"))
 CONSENSUS_MAX_RETRY = int(os.environ.get("AGENT_CONSENSUS_MAX_RETRY", "2"))
 CODEX_REVIEW_MAX_RETRY = int(os.environ.get("CODEX_REVIEW_MAX_RETRY", "2"))
+ACCEPTANCE_REVIEW_MAX_RETRY = int(os.environ.get("ACCEPTANCE_REVIEW_MAX_RETRY", "2"))
 CLARIFICATION_TIMEOUT_HOURS = int(os.environ.get("AGENT_CLARIFICATION_TIMEOUT_HOURS", "48"))
 FIGMA_FETCH_SCRIPT = PROJECT_ROOT / "AICodeAgent" / "scripts" / "figma_fetch.sh"
 
@@ -852,6 +853,26 @@ Codex 逻辑审查未通过（第 {attempt} 次修复）
 """
 
 
+def build_acceptance_fix_prompt(requirement: str, review_report: str, attempt: int) -> str:
+    return f"""
+需求验收审查未通过（第 {attempt} 次修复）
+
+原始需求（必须完整满足）:
+{requirement}
+
+验收审查报告:
+{review_report[:6000]}
+
+修复规则:
+1. 对照 Requirement coverage 逐条补全或修正实现
+2. 修复 Logic issues / Performance issues 中指出的明显问题
+3. 仅改相关文件；不要跑 Gradle/git；不要新增第三方依赖
+4. site enName 用 TextUtils.equals()；UIState 不可变
+
+请输出修复代码，=== FILE: path === 格式。
+"""
+
+
 def _parse_intake_json(claude_output: str) -> dict:
     m = re.search(r"```json\s*(\{.*?\})\s*```", claude_output, re.DOTALL)
     if m:
@@ -1618,6 +1639,7 @@ def run_coding_build_pr(task: Task, ws: Path):
     build_passed = False
     attempt = 0
     codex_round = 0
+    acceptance_round = 0
 
     while attempt <= task.max_retries:
         transition(task.task_id, State.CODING, f"attempt {attempt + 1}")
@@ -1665,26 +1687,51 @@ def run_coding_build_pr(task: Task, ws: Path):
         )
         (ws / "codex_review.md").write_text(review_report, encoding="utf-8")
 
-        if passed:
-            print("[CODEX] Review PASS")
+        if not passed:
+            codex_round += 1
+            print(f"[CODEX] Review FAIL (round {codex_round}/{CODEX_REVIEW_MAX_RETRY})")
+            task.error_log = review_report[:4000]
+            save_task(task)
+            if codex_round > CODEX_REVIEW_MAX_RETRY:
+                write_unrecoverable_error(ws, task.raw_requirement, task.error_log)
+                transition(task.task_id, State.FAILED, "codex review max retries")
+                notify_telegram(task)
+                return
+            transition(task.task_id, State.CORRECTING, f"codex fail round {codex_round}")
+            context_file = build_context_file(task, ws)
+            initial_prompt = build_codex_fix_prompt(
+                task.raw_requirement, review_report, codex_round + 1
+            )
+            attempt += 1
+            continue
+
+        print("[CODEX] Review PASS — starting requirement acceptance review")
+        transition(task.task_id, State.REQUIREMENT_REVIEW, f"acceptance round {acceptance_round + 1}")
+        acc_passed, acc_report = run_requirement_acceptance_review(
+            task.raw_requirement, ws, base_branch=task.base_branch or ""
+        )
+        (ws / "requirement_review.md").write_text(acc_report, encoding="utf-8")
+
+        if acc_passed:
+            print("[ACCEPTANCE] Requirement review PASS")
             build_passed = True
             break
 
-        codex_round += 1
-        print(f"[CODEX] Review FAIL (round {codex_round}/{CODEX_REVIEW_MAX_RETRY})")
-        task.error_log = review_report[:4000]
+        acceptance_round += 1
+        print(
+            f"[ACCEPTANCE] FAIL (round {acceptance_round}/{ACCEPTANCE_REVIEW_MAX_RETRY})"
+        )
+        task.error_log = acc_report[:4000]
         save_task(task)
-
-        if codex_round > CODEX_REVIEW_MAX_RETRY:
+        if acceptance_round > ACCEPTANCE_REVIEW_MAX_RETRY:
             write_unrecoverable_error(ws, task.raw_requirement, task.error_log)
-            transition(task.task_id, State.FAILED, "codex review max retries")
+            transition(task.task_id, State.FAILED, "requirement review max retries")
             notify_telegram(task)
             return
-
-        transition(task.task_id, State.CORRECTING, f"codex fail round {codex_round}")
+        transition(task.task_id, State.CORRECTING, f"acceptance fail round {acceptance_round}")
         context_file = build_context_file(task, ws)
-        initial_prompt = build_codex_fix_prompt(
-            task.raw_requirement, review_report, codex_round + 1
+        initial_prompt = build_acceptance_fix_prompt(
+            task.raw_requirement, acc_report, acceptance_round + 1
         )
         attempt += 1
 

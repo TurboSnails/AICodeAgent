@@ -14,7 +14,7 @@
 | **需求 Intake** | Planning 后若信息不足 → **`waiting_clarification`**，用户 `/reply` 或 Web 澄清后再辩论 |
 | **编码契约** | Claude `--print` **只写代码**；Gradle / git / PR 由 Orchestrator 执行 |
 | **构建纠错** | Gradle 失败 → `correcting` → fix prompt 重试（`max_retries` 默认 3） |
-| **逻辑审查** | **Gradle 全绿后** → `codex_review`（Codex CLI 或 Claude 审查员）查逻辑/漏洞/回归，FAIL 再修 |
+| **逻辑审查** | 全绿 → `codex_review`（逻辑/漏洞/回归）→ `requirement_review`（对照原始需求 + 明显逻辑/性能），任一 FAIL 再修 |
 | **L2 闸门** | 辩论+共识后暂停 `waiting_gate`，`/continue` 或 Web 核准后再编码 |
 | **L0 快路径** | 跳过辩论，最小共识后直接编码 |
 | **视觉资产** | Code-First：`asset_analysis` → Figma 按需拉取 → `asset_map.json` |
@@ -55,7 +55,9 @@ graph TD
     N --> L
     M -->|全绿| O[Codex 逻辑审查]
     O -->|FAIL| N
-    O -->|PASS| P[Git Commit & PR]
+    O -->|PASS| O2[需求验收审查]
+    O2 -->|FAIL| N
+    O2 -->|PASS| P[Git Commit & PR]
 
     P --> Q[Telegram / GitHub]
 ```
@@ -80,8 +82,10 @@ stateDiagram-v2
     coding --> building: Claude 写完
     building --> codex_review: Gradle 全绿
     building --> correcting: 编译失败
-    codex_review --> git_committing: 审查 PASS
+    codex_review --> requirement_review: 逻辑审查 PASS
     codex_review --> correcting: 逻辑/回归 FAIL
+    requirement_review --> git_committing: 需求验收 PASS
+    requirement_review --> correcting: 不符合需求或性能问题
     correcting --> coding: fix prompt
     correcting --> failed: 超次数
     git_committing --> creating_pr
@@ -127,6 +131,7 @@ AICodeAgent/
     ├── user_clarification.md
     ├── consensus.md
     ├── codex_review.md
+    ├── requirement_review.md
     ├── asset_map.json
     └── ...
 ```
@@ -172,6 +177,7 @@ export FIGMA_TOKEN=...
 export AGENT_DEBATE_TIMEOUT=600
 export AGENT_CONSENSUS_MAX_RETRY=2
 export CODEX_REVIEW_MAX_RETRY=2
+export ACCEPTANCE_REVIEW_MAX_RETRY=2
 export AGENT_CLARIFICATION_TIMEOUT_HOURS=48
 export AGENT_TASK_TOTAL_TIMEOUT=7200
 
@@ -247,7 +253,7 @@ curl -X POST http://localhost:6789/api/continue \
 ## 关键设计
 
 1. **先澄清再辩论**：Intake Agent 用 `claude --print` 输出 JSON；不明确则写 `clarification_questions.md` 并通知用户。
-2. **构建与审查分离**：Claude 不跑 Gradle；全绿后 **Codex 阶段** 专查逻辑漏洞与对其他 case/站点的影响（结合 `get_impact_summary`）。
+2. **两阶段审查**：`codex_review`（回归/漏洞）通过后，`requirement_review` 对照 **原始需求** 与变更源码，查遗漏与明显逻辑/性能问题；报告见 `requirement_review.md`。
 3. **续跑标志**：`resume_from_gate`（L2）、`resume_after_clarification`（澄清后）— 任务回到 `pending` 由 Executor 再次 `process_task`。
 4. **安全边界**：`apply_code_changes` 黑名单（`jg_tools/`、`Configs.kt`、keystore 等）；任务结束恢复 `Configs.kt` 与 git 工作区。
 5. **串行执行**：单 Executor + 文件锁，避免多任务同时改同一 git tree。

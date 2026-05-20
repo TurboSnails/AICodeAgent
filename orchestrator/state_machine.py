@@ -24,6 +24,7 @@ class State(Enum):
     CODING = "coding"
     BUILDING = "building"
     CODEX_REVIEW = "codex_review"
+    REQUIREMENT_REVIEW = "requirement_review"
     CORRECTING = "correcting"
     GIT_COMMITTING = "git_committing"
     CREATING_PR = "creating_pr"
@@ -42,7 +43,8 @@ VALID_TRANSITIONS = {
     State.WAITING_GATE: [State.CODING, State.CANCELLED, State.PENDING],
     State.CODING: [State.BUILDING, State.CANCELLED],
     State.BUILDING: [State.CODEX_REVIEW, State.CORRECTING, State.CANCELLED],
-    State.CODEX_REVIEW: [State.GIT_COMMITTING, State.CORRECTING, State.CANCELLED],
+    State.CODEX_REVIEW: [State.REQUIREMENT_REVIEW, State.CORRECTING, State.CANCELLED],
+    State.REQUIREMENT_REVIEW: [State.GIT_COMMITTING, State.CORRECTING, State.CANCELLED],
     State.CORRECTING: [State.CODING, State.FAILED, State.CANCELLED],
     State.GIT_COMMITTING: [State.CREATING_PR, State.CANCELLED],
     State.CREATING_PR: [State.NOTIFYING, State.CANCELLED],

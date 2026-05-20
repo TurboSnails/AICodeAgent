@@ -190,8 +190,10 @@ stateDiagram-v2
     coding --> building: Claude 写完
     building --> codex_review: Gradle 全绿
     building --> correcting: 编译失败
-    codex_review --> git_committing: Codex PASS
+    codex_review --> requirement_review: Codex PASS
     codex_review --> correcting: 逻辑/回归 FAIL
+    requirement_review --> git_committing: 需求验收 PASS
+    requirement_review --> correcting: 需求/性能 FAIL
     correcting --> coding: fix prompt
     correcting --> failed: 超次数
     git_committing --> creating_pr: push
@@ -213,8 +215,10 @@ stateDiagram-v2
 | `clarify_done` | `waiting_clarification` | `pending` | 用户 `/reply` 或 Web `/api/reply` |
 | `codex_pass` | `codex_review` | `git_committing` | Codex/Claude 逻辑审查通过 |
 | `codex_fail` | `codex_review` | `correcting` | 逻辑漏洞或回归风险，回到编码修复 |
+| `acceptance_pass` | `requirement_review` | `git_committing` | 对照原始需求与源码，无明显逻辑/性能问题 |
+| `acceptance_fail` | `requirement_review` | `correcting` | 需求遗漏、实现偏差或性能红线 |
 
-**Codex 审查**：构建全绿后调用 `codex_review.py`（优先 `CODEX_CMD` / `codex` CLI，否则 `claude --print` 审查员 persona）。结合 `graph_bridge.get_impact_summary` 评估对其他 case 的影响。报告写入 `workspace/{id}/codex_review.md`。
+**两阶段审查**（`codex_review.py`）：① `run_codex_review` 逻辑/回归；② `run_requirement_acceptance_review` 需求符合度 + 明显逻辑/性能（读变更 `.kt/.xml` 片段）。报告：`codex_review.md`、`requirement_review.md`。优先 `CODEX_CMD`，否则 `claude --print`。
 
 ---
 

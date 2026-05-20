@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-构建全绿后的 Codex / Claude 逻辑审查：
-- 逻辑正确性与漏洞
-- 对既有 case / 流程的回归影响（结合 graph_bridge 影响面）
+构建全绿后的两阶段审查（均可用 Codex CLI 或 Claude 回退）：
+1. Codex 逻辑审查：漏洞、回归、多站点影响
+2. 需求验收审查：是否符合原始需求、明显逻辑/性能问题
 """
 
 from __future__ import annotations
@@ -200,28 +200,140 @@ def codex_review_print(prompt: str, context_text: str) -> str:
         return ""
 
 
+def _workspace_context(workspace: Path, extra_names: Optional[List[str]] = None) -> str:
+    names = ["consensus.md", "asset_map.json", "site_warnings.md", "codex_review.md"]
+    if extra_names:
+        names = extra_names + names
+    parts = []
+    for name in names:
+        p = workspace / name
+        if p.exists():
+            parts.append(f"### {name}\n{p.read_text(encoding='utf-8')[:4000]}\n")
+    return "\n".join(parts)
+
+
+def _read_changed_sources(changed_files: List[str], max_total: int = 28000) -> str:
+    """读取变更源码片段供验收审查"""
+    chunks = []
+    total = 0
+    for rel in changed_files:
+        if not rel.endswith((".kt", ".kts", ".xml")):
+            continue
+        path = PROJECT_ROOT / rel
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        block = f"### `{rel}`\n```\n{text[:6000]}\n```\n"
+        if total + len(block) > max_total:
+            chunks.append(f"### `{rel}`\n（已截断，文件过长）\n")
+            break
+        chunks.append(block)
+        total += len(block)
+    return "\n".join(chunks) if chunks else "（未能读取变更源码）"
+
+
+def build_requirement_acceptance_prompt(
+    requirement: str,
+    workspace: Path,
+    changed_files: List[str],
+    prior_codex_report: str,
+) -> str:
+    consensus = ""
+    cp = workspace / "consensus.md"
+    if cp.exists():
+        consensus = cp.read_text(encoding="utf-8")[:6000]
+
+    code_excerpt = _read_changed_sources(changed_files)
+
+    return f"""
+你是 **需求验收审查员**（只读）。Codex 逻辑审查已通过，请专注：**实现是否真正满足用户原始需求**，以及 **明显的逻辑/性能问题**。
+
+## 用户原始需求（最高优先级，逐条对照）
+{requirement}
+
+## 共识方案（实现应对齐）
+{consensus[:5000] if consensus else "（无）"}
+
+## 上一轮 Codex 审查摘要（勿重复已 PASS 的回归项，除非仍相关）
+{prior_codex_report[:2500] if prior_codex_report else "（无）"}
+
+## 本次变更源码（节选）
+{code_excerpt}
+
+## 审查维度（必须逐项）
+1. **需求符合度**：原始需求中的功能点是否全部实现？有无遗漏、做错页面/站点、与需求矛盾的实现？
+2. **验收标准**：若需求含交互/文案/边界，代码是否体现？
+3. **明显逻辑错误**：死代码、永远为 false 的分支、错误的状态更新、遗漏的 Event 上报等（编译已通过层面的逻辑）。
+4. **明显性能问题**：主线程 IO、Composable 内重复分配大对象、无 key 的 Lazy 列表、可预见的 O(n²) 循环、未 remember 的昂贵计算等。
+5. **与 consensus 偏差**：若偏离 consensus 且损害需求，判 FAIL。
+
+## 输出格式（严格遵守）
+```markdown
+## Verdict
+PASS 或 FAIL
+
+## Requirement coverage
+- 逐条对照原始需求：已实现 / 缺失 / 错误
+
+## Logic issues
+- 
+
+## Performance issues
+- （无则写 无）
+
+## Suggested fixes
+- （FAIL 时必填；PASS 可写 无）
+```
+
+**判定**：任一核心需求未实现、实现与需求明显不符、或存在必须修复的逻辑/性能问题 → **FAIL**。
+仅极小 nit 且用户可接受 → **PASS**。
+"""
+
+
 def run_codex_review(
     requirement: str,
     workspace: Path,
     base_branch: str = "",
 ) -> Tuple[bool, str]:
-    """
-    执行审查，返回 (passed, full_report_markdown)。
-    """
+    """阶段 1：逻辑/回归审查。返回 (passed, report_markdown)。"""
     changed = list_changed_files(base_branch)
     if not changed:
         changed = extract_files_from_consensus(workspace)
     impact = get_impact_summary(changed) if changed else ""
 
-    ctx_parts = []
-    for name in ("consensus.md", "asset_map.json", "site_warnings.md"):
-        p = workspace / name
-        if p.exists():
-            ctx_parts.append(f"### {name}\n{p.read_text(encoding='utf-8')[:4000]}\n")
-    context_text = "\n".join(ctx_parts)
-
+    context_text = _workspace_context(workspace)
     prompt = build_codex_review_prompt(requirement, workspace, changed, impact)
     raw = codex_review_print(prompt, context_text)
     report = f"# Codex Logic Review\n\n{raw}\n" if raw else "# Codex Logic Review\n\n(empty output — treat as FAIL)\n"
+    passed = parse_codex_verdict(raw)
+    return passed, report
+
+
+def run_requirement_acceptance_review(
+    requirement: str,
+    workspace: Path,
+    base_branch: str = "",
+) -> Tuple[bool, str]:
+    """阶段 2：原始需求符合度 + 明显逻辑/性能。须在 Codex PASS 之后调用。"""
+    changed = list_changed_files(base_branch)
+    if not changed:
+        changed = extract_files_from_consensus(workspace)
+
+    prior = ""
+    cr = workspace / "codex_review.md"
+    if cr.exists():
+        prior = cr.read_text(encoding="utf-8")
+
+    context_text = _workspace_context(workspace) + "\n" + _read_changed_sources(changed)
+    prompt = build_requirement_acceptance_prompt(requirement, workspace, changed, prior)
+    raw = codex_review_print(prompt, context_text)
+    report = (
+        f"# Requirement Acceptance Review\n\n{raw}\n"
+        if raw
+        else "# Requirement Acceptance Review\n\n(empty output — treat as FAIL)\n"
+    )
     passed = parse_codex_verdict(raw)
     return passed, report
