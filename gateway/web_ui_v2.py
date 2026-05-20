@@ -23,7 +23,7 @@ DB_FILE = PROJECT_ROOT / "AICodeAgent" / "data" / "agent.db"
 PORT = 6789
 
 sys.path.insert(0, str(PROJECT_ROOT / "AICodeAgent" / "orchestrator"))
-from state_machine import init_db, save_task, Task, get_task, approve_gate_resume, State
+from state_machine import init_db, save_task, Task, get_task, approve_gate_resume, cancel_task, State
 from platform_figma import list_platform_sites_for_ui
 
 
@@ -53,6 +53,12 @@ INDEX_HTML = """<!DOCTYPE html>
   button:hover { background: #7dd3fc; }
   .task-item { background: #1e293b; padding: 16px; border-radius: 8px; margin-bottom: 12px; border-left: 4px solid #38bdf8; }
   .meta { font-size: 12px; color: #94a3b8; margin-top: 6px; }
+  .btn-sm { padding: 6px 12px; font-size: 12px; margin-top: 8px; margin-right: 8px; }
+  .btn-continue { background: #22c55e; }
+  .btn-continue:hover { background: #4ade80; }
+  .btn-cancel { background: #ef4444; }
+  .btn-cancel:hover { background: #f87171; }
+  .gate-card { border-left-color: #f59e0b; }
 </style>
 </head>
 <body>
@@ -76,6 +82,10 @@ INDEX_HTML = """<!DOCTYPE html>
   <div id="result" style="margin-top:12px;"></div>
 </div>
 <div class="card">
+  <h2>L2 待核准任务</h2>
+  <div id="gateList">加载中...</div>
+</div>
+<div class="card">
   <h2>任务历史</h2>
   <div id="taskList">加载中...</div>
 </div>
@@ -97,12 +107,48 @@ async function refreshTasks() {
   const container = document.getElementById('taskList');
   if (data.tasks.length === 0) { container.innerHTML = '<p style="color:#94a3b8">暂无任务</p>'; return; }
   container.innerHTML = data.tasks.reverse().map(t =>
-    `<div class="task-item" style="border-left-color:${t.current_state==='completed'?'#22c55e':t.current_state==='failed'?'#ef4444':'#38bdf8'}">
+    `<div class="task-item" style="border-left-color:${t.current_state==='completed'?'#22c55e':t.current_state==='failed'?'#ef4444':t.current_state==='cancelled'?'#6b7280':'#38bdf8'}">
       <div><strong>${t.raw_requirement.substring(0,60)}${t.raw_requirement.length>60?'...':''}</strong></div>
       <div class="meta">ID: ${t.task_id} | 等级: ${t.level} | 站点: ${t.site_hint||'auto'} | 状态: ${t.current_state} | ${t.created_at}</div>
       ${t.pr_url ? `<div class="meta">PR: <a href="${t.pr_url}" target="_blank" style="color:#38bdf8">${t.pr_url}</a></div>` : ''}
+      ${t.current_state !== 'completed' && t.current_state !== 'failed' && t.current_state !== 'cancelled' ? `<button class="btn-sm btn-cancel" onclick="cancelTask('${t.task_id}')">取消</button>` : ''}
     </div>`
   ).join('');
+}
+async function refreshGates() {
+  const res = await fetch('/api/waiting_gates');
+  const data = await res.json();
+  const container = document.getElementById('gateList');
+  if (data.gates.length === 0) { container.innerHTML = '<p style="color:#94a3b8">暂无待核准任务</p>'; return; }
+  container.innerHTML = data.gates.map(t =>
+    `<div class="task-item gate-card">
+      <div><strong>${t.raw_requirement.substring(0,60)}${t.raw_requirement.length>60?'...':''}</strong></div>
+      <div class="meta">ID: ${t.task_id} | 等级: ${t.level} | 站点: ${t.site_hint||'auto'} | 创建于 ${t.created_at}</div>
+      <button class="btn-sm btn-continue" onclick="continueTask('${t.task_id}')">✅ 继续编码</button>
+      <button class="btn-sm btn-cancel" onclick="cancelTask('${t.task_id}')">❌ 取消</button>
+    </div>`
+  ).join('');
+}
+async function continueTask(tid) {
+  const res = await fetch('/api/continue', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ task_id: tid })
+  });
+  const data = await res.json();
+  alert(data.message);
+  refreshGates();
+  refreshTasks();
+}
+async function cancelTask(tid) {
+  if (!confirm('确定要取消任务 ' + tid + ' 吗？')) return;
+  const res = await fetch('/api/cancel', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ task_id: tid })
+  });
+  const data = await res.json();
+  alert(data.message);
+  refreshGates();
+  refreshTasks();
 }
 document.getElementById('taskForm').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -118,7 +164,9 @@ document.getElementById('taskForm').addEventListener('submit', async (e) => {
 });
 loadSites();
 refreshTasks();
+refreshGates();
 setInterval(refreshTasks, 5000);
+setInterval(refreshGates, 5000);
 </script>
 </body>
 </html>
@@ -152,6 +200,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"tasks": tasks})
         elif path == "/api/sites":
             self._json({"sites": scan_sites()})
+        elif path == "/api/waiting_gates":
+            conn = sqlite3.connect(str(DB_FILE))
+            cursor = conn.execute(
+                "SELECT task_id, raw_requirement, level, site_hint, current_state, pr_url, created_at FROM task_queue WHERE current_state = ? ORDER BY created_at DESC",
+                (State.WAITING_GATE.value,)
+            )
+            rows = cursor.fetchall()
+            conn.close()
+            gates = [{"task_id": r[0], "raw_requirement": r[1], "level": r[2], "site_hint": r[3],
+                      "current_state": r[4], "pr_url": r[5] or "", "created_at": r[6]} for r in rows]
+            self._json({"gates": gates})
+            return
         elif path == "/health":
             # 健康检查：统计各状态任务数
             import sqlite3
@@ -215,6 +275,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"ok": True, "message": f"L2 已核准，任务 {tid} 已重新入队"})
             else:
                 self._json({"ok": False, "message": "核准失败"}, 500)
+            return
+        if path == "/api/cancel":
+            try:
+                payload = json.loads(body) if body else {}
+            except Exception:
+                self._json({"ok": False, "message": "invalid json"}, 400)
+                return
+            tid = (payload.get("task_id") or "").strip()
+            if not tid:
+                self._json({"ok": False, "message": "task_id 必填"}, 400)
+                return
+            task = get_task(tid)
+            if not task or task.current_state in (State.COMPLETED.value, State.FAILED.value, State.CANCELLED.value):
+                self._json({"ok": False, "message": f"任务 {tid} 不存在或已结束"}, 400)
+                return
+            if cancel_task(tid, reason="user cancelled via web"):
+                self._json({"ok": True, "message": f"任务 {tid} 已取消"})
+            else:
+                self._json({"ok": False, "message": "取消失败"}, 500)
             return
         self._json({"error": "not found"}, 404)
 

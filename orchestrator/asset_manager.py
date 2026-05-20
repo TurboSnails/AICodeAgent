@@ -10,11 +10,44 @@ import json
 import os
 import re
 import shutil
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+
+def _figma_api_request(req: urllib.request.Request, timeout: int = 60, max_retries: int = 3) -> Optional[bytes]:
+    """Figma API 指数退避重试封装。处理 429 / 5xx / timeout。"""
+    base_delay = float(os.environ.get("FIGMA_RETRY_DELAY", "2.0"))
+    last_err: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code == 429:
+                delay = (2 ** attempt) * base_delay
+                print(f"[FIGMA API] 429 Rate Limited, retrying in {delay}s (attempt {attempt + 1}/{max_retries + 1})")
+                time.sleep(delay)
+                continue
+            if 500 <= e.code < 600:
+                delay = (2 ** attempt) * base_delay
+                print(f"[FIGMA API] {e.code} Server Error, retrying in {delay}s (attempt {attempt + 1}/{max_retries + 1})")
+                time.sleep(delay)
+                continue
+            print(f"[FIGMA API] HTTP {e.code}: {e.reason}")
+            return None
+        except Exception as e:
+            last_err = e
+            delay = (2 ** attempt) * base_delay
+            print(f"[FIGMA API] {e}, retrying in {delay}s (attempt {attempt + 1}/{max_retries + 1})")
+            time.sleep(delay)
+    print(f"[FIGMA API] Max retries exceeded: {last_err}")
+    return None
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SIMILARITY_THRESHOLD = float(os.environ.get("ASSET_HASH_SIMILARITY", "0.95"))
@@ -371,12 +404,10 @@ def fetch_figma_svg_via_api(
         f"?ids={urllib.parse.quote(ids_param)}&format=svg"
     )
     req = urllib.request.Request(url, headers={"X-Figma-Token": token})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"[FIGMA API] {e}")
+    raw = _figma_api_request(req, timeout=60, max_retries=3)
+    if raw is None:
         return []
+    data = json.loads(raw.decode("utf-8"))
 
     images = data.get("images") or {}
     assets_dir = workspace / "figma" / "assets"
@@ -386,15 +417,18 @@ def fetch_figma_svg_via_api(
     for node_id, img_url in images.items():
         if not img_url:
             continue
+        svg_req = urllib.request.Request(img_url)
+        svg_data = _figma_api_request(svg_req, timeout=30, max_retries=2)
+        if svg_data is None:
+            print(f"[FIGMA API] download {node_id}: failed after retries")
+            continue
         try:
-            with urllib.request.urlopen(img_url, timeout=30) as r:
-                svg_data = r.read()
             name = sanitize_asset_name(node_id.replace(":", "_"))
             out = assets_dir / f"{name}.svg"
             out.write_bytes(svg_data)
             downloaded.append({"node_id": node_id, "file": str(out.name)})
         except Exception as e:
-            print(f"[FIGMA API] download {node_id}: {e}")
+            print(f"[FIGMA API] write {node_id}: {e}")
 
     return downloaded
 
@@ -403,12 +437,10 @@ def sniff_figma_icon_nodes(file_key: str, token: str, keywords: List[str]) -> Li
     """从 Figma 文件 JSON 嗅探可能为图标的节点 id"""
     url = f"https://api.figma.com/v1/files/{file_key}?depth=2"
     req = urllib.request.Request(url, headers={"X-Figma-Token": token})
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            doc = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"[FIGMA API] file fetch: {e}")
+    raw = _figma_api_request(req, timeout=120, max_retries=3)
+    if raw is None:
         return []
+    doc = json.loads(raw.decode("utf-8"))
 
     ids: List[str] = []
     kw_lower = [k.lower() for k in keywords if len(k) > 2]

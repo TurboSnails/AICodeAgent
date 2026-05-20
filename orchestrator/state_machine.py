@@ -32,17 +32,17 @@ class State(Enum):
 
 
 VALID_TRANSITIONS = {
-    State.PENDING: [State.PLANNING],
-    State.PLANNING: [State.DEBATING, State.CODING],
-    State.DEBATING: [State.CONSENSUS, State.CORRECTING],
-    State.CONSENSUS: [State.WAITING_GATE, State.CODING],
+    State.PENDING: [State.PLANNING, State.CANCELLED],
+    State.PLANNING: [State.DEBATING, State.CODING, State.CANCELLED],
+    State.DEBATING: [State.CONSENSUS, State.CORRECTING, State.CANCELLED],
+    State.CONSENSUS: [State.WAITING_GATE, State.CODING, State.CANCELLED],
     State.WAITING_GATE: [State.CODING, State.CANCELLED, State.PENDING],
-    State.CODING: [State.BUILDING],
-    State.BUILDING: [State.GIT_COMMITTING, State.CORRECTING],
-    State.CORRECTING: [State.CODING, State.FAILED],
-    State.GIT_COMMITTING: [State.CREATING_PR],
-    State.CREATING_PR: [State.NOTIFYING],
-    State.NOTIFYING: [State.COMPLETED, State.FAILED],
+    State.CODING: [State.BUILDING, State.CANCELLED],
+    State.BUILDING: [State.GIT_COMMITTING, State.CORRECTING, State.CANCELLED],
+    State.CORRECTING: [State.CODING, State.FAILED, State.CANCELLED],
+    State.GIT_COMMITTING: [State.CREATING_PR, State.CANCELLED],
+    State.CREATING_PR: [State.NOTIFYING, State.CANCELLED],
+    State.NOTIFYING: [State.COMPLETED, State.FAILED, State.CANCELLED],
 }
 
 
@@ -308,6 +308,47 @@ def get_waiting_gates() -> list[Task]:
     rows = cursor.fetchall()
     conn.close()
     return [_row_to_task(r) for r in rows]
+
+
+def cancel_task(task_id: str, reason: str = "user cancelled") -> bool:
+    """取消任务：从任意非终态强制流转到 CANCELLED，无需经过常规 transition 校验"""
+    terminal = {State.COMPLETED.value, State.FAILED.value, State.CANCELLED.value}
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM task_queue WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            conn.execute("ROLLBACK")
+            conn.close()
+            return False
+
+        current = row["current_state"]
+        if current in terminal:
+            conn.execute("ROLLBACK")
+            conn.close()
+            print(f"[CANCEL] Task {task_id} already in terminal state {current}")
+            return False
+
+        now = datetime.now().isoformat()
+        conn.execute(
+            "UPDATE task_queue SET current_state = ?, updated_at = ?, status = ? WHERE task_id = ?",
+            (State.CANCELLED.value, now, State.CANCELLED.value, task_id),
+        )
+        conn.execute(
+            "INSERT INTO state_history (task_id, from_state, to_state, reason, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (task_id, current, State.CANCELLED.value, reason, now),
+        )
+        conn.commit()
+        print(f"[CANCEL] {task_id}: {current} -> cancelled | {reason}")
+        return True
+    except sqlite3.OperationalError as e:
+        print(f"[CANCEL ERROR] {e}")
+        conn.execute("ROLLBACK")
+        return False
+    finally:
+        conn.close()
 
 
 def _row_to_task(row: sqlite3.Row) -> Task:

@@ -197,8 +197,24 @@ def _run_single_debate_agent(
 
 
 def run_agent_debate(task: Task, workspace: Path) -> bool:
-    """并行调用三个 Agent，整体与单 Agent 均有超时"""
-    print(f"[DEBATE] Starting multi-agent debate for {task.task_id}")
+    """并行调用三个 Agent，支持重试与降级为 Architect Only"""
+    max_retries = int(os.environ.get("AGENT_DEBATE_MAX_RETRY", "1"))
+
+    for attempt in range(max_retries + 1):
+        print(f"[DEBATE] Attempt {attempt + 1}/{max_retries + 1} for {task.task_id}")
+        if _try_debate(task, workspace):
+            return True
+        if attempt < max_retries:
+            print(f"[DEBATE] Retrying in 5s...")
+            time.sleep(5)
+
+    # 重试耗尽，尝试降级为 Architect Only
+    print(f"[DEBATE] All retries exhausted, falling back to Architect Only")
+    return _run_architect_only_fallback(task, workspace)
+
+
+def _try_debate(task: Task, workspace: Path) -> bool:
+    """单次 Debate 调用"""
     build_debate_prompts(task, workspace)
     build_debate_context_file(workspace)
 
@@ -235,6 +251,54 @@ def run_agent_debate(task: Task, workspace: Path) -> bool:
     if len(results) < 3 or not all(results.values()):
         print(f"[DEBATE] Incomplete or empty outputs: {results}")
         return False
+    return True
+
+
+def _run_architect_only_fallback(task: Task, workspace: Path) -> bool:
+    """
+    Debate 失败后的降级策略：仅运行 Architect Agent，
+    将其输出直接作为最终方案写入 consensus.md，跳过 Guardian/Figma 审查。
+    """
+    print(f"[DEBATE FALLBACK] Running Architect Only for {task.task_id}")
+    # 重新构建 Architect prompt（已存在则复用）
+    build_debate_prompts(task, workspace)
+    context_file = workspace / "claude_context.md"
+    prompt_file = workspace / "architect_proposal.md"
+    output_file = "architect_proposal_output.md"
+
+    _, ok = _run_single_debate_agent(
+        "architect", prompt_file, output_file, context_file, workspace, AGENT_TIMEOUT
+    )
+    if not ok:
+        print(f"[DEBATE FALLBACK] Architect Only also failed")
+        return False
+
+    # 生成简化版 consensus.md
+    architect_output = (workspace / "architect_proposal_output.md").read_text(encoding="utf-8")
+    fallback_consensus = f"""# consensus.md — 降级方案（Debate 失败，Architect Only）
+
+## 任务概述
+- 需求: {task.raw_requirement}
+- 等级: {task.level}
+- 降级原因: Multi-Agent Debate 超时或失败，回退至 Architect 单 Agent
+
+## 技术方案 (Architect Only)
+{architect_output[:4000]}
+
+## 合规审查 (降级跳过)
+- ⚠️ Guardian 未参与：请在 Review 时特别关注 SiteRules 和 Compose 规范
+
+## 视觉规范 (降级跳过)
+- ⚠️ Figma Auditor 未参与：请人工确认视觉资产需求
+
+## 最终文件清单
+（请从 Architect 方案中手动提取文件路径填入此处表格）
+
+## 视觉资产映射
+（降级模式下未执行自动资产去重，请人工确认）
+"""
+    (workspace / "consensus.md").write_text(fallback_consensus, encoding="utf-8")
+    print(f"[DEBATE FALLBACK] consensus.md generated from Architect Only ({len(fallback_consensus)} chars)")
     return True
 
 
@@ -291,8 +355,91 @@ def build_consensus_prompt(task: Task, workspace: Path) -> str:
 """
 
 
+GUARDIAN_CONSTRAINT_PATTERNS = [
+    (r"禁止.*新依赖|禁止.*第三方|不允许.*新依赖|不允许.*第三方|No new dependency|No third-party", "禁止新依赖"),
+    (r"必须使用\s+SiteCapsRegistry|SiteCapsRegistry", "必须使用 SiteCapsRegistry"),
+    (r"UIState.*不可变|immutable data class|UIState.*data class", "UIState 不可变"),
+    (r"collectAsStateWithLifecycle|必须使用.*collectAsStateWithLifecycle", "collectAsStateWithLifecycle"),
+    (r"TextUtils\.equals|必须使用.*TextUtils", "TextUtils.equals"),
+    (r"ImmutableList|kotlinx\.collections\.immutable", "ImmutableList"),
+    (r"禁止空\s*try-catch|空\s*try-catch", "禁止空 try-catch"),
+]
+
+
+def _extract_guardian_constraints(guardian_text: str) -> list[dict]:
+    """从 Guardian 输出中提取结构化约束"""
+    constraints = []
+    for pattern, label in GUARDIAN_CONSTRAINT_PATTERNS:
+        if re.search(pattern, guardian_text, re.IGNORECASE):
+            constraints.append({"label": label, "pattern": pattern})
+    return constraints
+
+
+def _check_architect_against_constraints(architect_text: str, constraints: list[dict]) -> list[dict]:
+    """检查 Architect 方案是否违反 Guardian 约束"""
+    violations = []
+    text_lower = architect_text.lower()
+
+    for c in constraints:
+        label = c["label"]
+        if label == "禁止新依赖":
+            if any(k in text_lower for k in ("新增依赖", "引入库", "第三方库")) or "libs.versions.toml" in architect_text:
+                violations.append({"constraint": label, "detail": "Architect 方案提及新增依赖，但 Guardian 禁止"})
+        elif label == "必须使用 SiteCapsRegistry":
+            if "sitecapsregistry" not in text_lower and "siterules" not in text_lower:
+                violations.append({"constraint": label, "detail": "Architect 方案未提及 SiteCapsRegistry 或 SiteRules"})
+        elif label == "UIState 不可变":
+            if "mutablestate" in text_lower or ("var " in text_lower and "uistate" in text_lower):
+                violations.append({"constraint": label, "detail": "Architect 方案中 UIState 似乎包含可变状态"})
+        elif label == "collectAsStateWithLifecycle":
+            if "collectasstatewithlifecycle" not in text_lower and "collectasstate()" in text_lower:
+                violations.append({"constraint": label, "detail": "Architect 方案使用了 collectAsState() 而非 collectAsStateWithLifecycle()"})
+        elif label == "TextUtils.equals":
+            if "textutils.equals" not in text_lower and ("enname ==" in text_lower or 'enname.equals' in text_lower):
+                violations.append({"constraint": label, "detail": "Architect 方案中对 enName 的比较未使用 TextUtils.equals()"})
+        elif label == "ImmutableList":
+            if "immutablelist" not in text_lower and ("list<" in text_lower or "mutablelist" in text_lower):
+                violations.append({"constraint": label, "detail": "Architect 方案中列表状态未使用 ImmutableList"})
+        elif label == "禁止空 try-catch":
+            if re.search(r"try\s*\{\s*\}\s*catch", architect_text, re.IGNORECASE):
+                violations.append({"constraint": label, "detail": "Architect 方案中存在空 try-catch"})
+
+    return violations
+
+
+def _validate_consensus(workspace: Path) -> tuple[bool, list[dict], str]:
+    """
+    结构化冲突校验：提取 Guardian 约束，与 Architect 方案交叉验证。
+    返回 (是否通过, 冲突列表, 校验报告文本)。
+    """
+    guardian_file = workspace / "guardian_review_output.md"
+    architect_file = workspace / "architect_proposal_output.md"
+    if not guardian_file.exists() or not architect_file.exists():
+        return True, [], "Guardian 或 Architect 输出缺失，跳过校验"
+
+    guardian_text = guardian_file.read_text(encoding="utf-8")
+    architect_text = architect_file.read_text(encoding="utf-8")
+
+    constraints = _extract_guardian_constraints(guardian_text)
+    if not constraints:
+        return True, [], "Guardian 未输出结构化约束，跳过校验"
+
+    violations = _check_architect_against_constraints(architect_text, constraints)
+    report_lines = [f"## Consensus Validation Report\n", f"提取到 {len(constraints)} 条 Guardian 约束:"]
+    for c in constraints:
+        report_lines.append(f"- ✅ {c['label']}")
+    if violations:
+        report_lines.append(f"\n发现 {len(violations)} 处冲突:")
+        for v in violations:
+            report_lines.append(f"- ❌ [{v['constraint']}] {v['detail']}")
+    else:
+        report_lines.append("\n未检测到冲突，Guardian 约束全部满足。")
+    report = "\n".join(report_lines)
+    return len(violations) == 0, violations, report
+
+
 def run_consensus(task: Task, workspace: Path) -> bool:
-    """运行 Consensus Agent，生成最终方案"""
+    """运行 Consensus Agent，生成最终方案，并进行结构化冲突校验"""
     for attempt in range(CONSENSUS_MAX_RETRY + 1):
         print(f"[CONSENSUS] Attempt {attempt + 1}")
         consensus_prompt = build_consensus_prompt(task, workspace)
@@ -304,6 +451,20 @@ def run_consensus(task: Task, workspace: Path) -> bool:
 
         (workspace / "consensus.md").write_text(consensus_output, encoding="utf-8")
         print(f"[CONSENSUS] Done ({len(consensus_output)} chars)")
+
+        # 结构化冲突校验
+        passed, violations, report = _validate_consensus(workspace)
+        (workspace / "consensus_validation.md").write_text(report, encoding="utf-8")
+        if not passed:
+            print(f"[CONSENSUS] Validation failed with {len(violations)} violations")
+            if attempt >= CONSENSUS_MAX_RETRY:
+                print("[CONSENSUS] Max retry reached, forcing L2 gate")
+                # 强制转为 L2，等待人工核准
+                task.level = "L2"
+                save_task(task)
+                return True  # 返回 True 让上层进入 waiting_gate
+            continue
+        print("[CONSENSUS] Validation passed")
         return True
 
     return False
@@ -340,16 +501,17 @@ def create_agent_branch(task_id: str, base_branch: str) -> str:
     return branch
 
 
-def switch_site_if_needed(site_hint: str):
+def switch_site_if_needed(site_hint: str) -> bool:
+    """切换 active site，返回是否发生了实际切换"""
     if not site_hint:
-        return
+        return False
     configs = PROJECT_ROOT / "buildSrc" / "src" / "main" / "kotlin" / "Configs.kt"
     if not configs.exists():
-        return
+        return False
     content = configs.read_text(encoding="utf-8")
     match = re.search(r'(val\s+site\s*:\s*Site\s*=\s*)(\w+)', content)
     if not match:
-        return
+        return False
     current = match.group(2)
     # 去掉 Debug/Release 后缀后再比较，避免子串误匹配
     current_stem = current
@@ -363,20 +525,53 @@ def switch_site_if_needed(site_hint: str):
             hint_stem = hint_stem[: -len(suffix)]
             break
     if hint_stem.lower() == current_stem.lower():
-        return
+        return False
     site_dir = PROJECT_ROOT / "buildSrc" / "src" / "main" / "kotlin" / "site"
     candidates = [f.stem for f in site_dir.glob("*.kt")
                   if hint_stem.lower() == f.stem.lower() and f.stem not in ("Site", "SiteChannels")]
     if not candidates:
-        return
+        return False
     target = candidates[0] + "Debug"
     new_content = re.sub(r'(val\s+site\s*:\s*Site\s*=\s*)\w+', rf'\g<1>{target}', content)
     configs.write_text(new_content, encoding="utf-8")
     print(f"[SITE] Switched: {current} -> {target}")
+    return True
+
+
+def _collect_rag_candidates() -> list[Path]:
+    """收集所有可能的 RAG 候选文件路径：main/java + 所有 uiStyle 层级 + sport/ 模块"""
+    dirs_to_scan: list[Path] = []
+
+    # 1. 主代码源集
+    main_java = PROJECT_ROOT / "app" / "src" / "main" / "java"
+    if main_java.exists():
+        dirs_to_scan.append(main_java)
+
+    # 2. 所有 uiStyle 层级（多站点特定代码）
+    uiStyle_root = PROJECT_ROOT / "app" / "src" / "uiStyle"
+    if uiStyle_root.exists():
+        for first_level in uiStyle_root.iterdir():
+            if not first_level.is_dir():
+                continue
+            for sub in first_level.rglob("java"):
+                if sub.is_dir():
+                    dirs_to_scan.append(sub)
+
+    # 3. sport/ 共享模块
+    sport_java = PROJECT_ROOT / "sport" / "src" / "main" / "java"
+    if sport_java.exists():
+        dirs_to_scan.append(sport_java)
+
+    candidates: list[Path] = []
+    for d in dirs_to_scan:
+        for f in d.rglob("*.kt"):
+            if "Screen" in f.name or "ViewModel" in f.name or "Contract" in f.name or "UseCase" in f.name:
+                candidates.append(f)
+    return candidates
 
 
 def build_rag_context(requirement: str = "") -> str:
-    """RAG：关键词/图谱检索 + 最近修改的 Screen/ViewModel Few-Shot"""
+    """RAG：关键词/图谱检索 + 最近修改的 Screen/ViewModel/Contract/UseCase Few-Shot"""
     examples = []
     seen = set()
 
@@ -391,25 +586,23 @@ def build_rag_context(requirement: str = "") -> str:
                 except Exception:
                     pass
 
-    java_dir = PROJECT_ROOT / "app" / "src" / "main" / "java"
-    if java_dir.exists():
-        candidates = sorted(
-            [f for f in java_dir.rglob("*.kt") if "Screen" in f.name or "ViewModel" in f.name],
-            key=lambda f: f.stat().st_mtime,
-            reverse=True,
-        )
-        for c in candidates:
-            rel = str(c.relative_to(PROJECT_ROOT)).replace("\\", "/")
-            if rel in seen:
-                continue
-            seen.add(rel)
-            try:
-                content = c.read_text(encoding="utf-8")[:1500]
-                examples.append(f"### {rel}\n```kotlin\n{content}\n```")
-            except Exception:
-                pass
-            if len(examples) >= 5:
-                break
+    # 统一收集所有源集下的候选文件
+    candidates = _collect_rag_candidates()
+    # 按最近修改时间排序
+    candidates.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+
+    for c in candidates:
+        rel = str(c.relative_to(PROJECT_ROOT)).replace("\\", "/")
+        if rel in seen:
+            continue
+        seen.add(rel)
+        try:
+            content = c.read_text(encoding="utf-8")[:1500]
+            examples.append(f"### {rel}\n```kotlin\n{content}\n```")
+        except Exception:
+            pass
+        if len(examples) >= 8:
+            break
 
     if examples:
         return "\n## Project Best Practices (Auto-Retrieved)\n\n" + "\n\n".join(examples)
@@ -497,11 +690,51 @@ def claude_code_print(prompt: str, context_file: Path, timeout: Optional[int] = 
         return ""
 
 
+# 安全黑名单：Claude 禁止修改的目录/文件模式
+BLOCKED_PATHS = [
+    ".github/",
+    "jg_tools/",
+    "benchmark/",
+    "gradle/wrapper/gradle-wrapper.properties",
+    # buildSrc 下除 site/ 和 Dependencies.kt/Version.kt/Utils.kt 外，Configs.kt 由 Orchestrator 控制
+    "buildSrc/src/main/kotlin/Configs.kt",
+    # 加密/密钥相关
+    "keystore/",
+    ".jks",
+    ".keystore",
+    # 禁止覆盖主题注册 KSP 生成文件
+    "SiteThemeRegistryGenerated",
+    # 禁止修改 CI/CD 配置
+    ".github/workflows/",
+    # 禁止修改 apk 保护脚本
+    "jg_tools/protect.sh",
+    "jg_tools/shell/",
+    # 禁止修改 baseline profile（由构建脚本自动同步）
+    "app/src/main/baselineProfiles/",
+]
+
+
+def _is_blocked_path(file_path: str) -> tuple[bool, str]:
+    """检查文件路径是否在黑名单中，返回 (是否被拦截, 原因)"""
+    # 统一使用正斜杠匹配
+    normalized = file_path.replace("\\", "/")
+    for pattern in BLOCKED_PATHS:
+        if pattern in normalized:
+            return True, f"命中安全黑名单: {pattern}"
+    # 额外拦截：BuildConfig 生成逻辑或加密密钥文件
+    if "BuildConfig" in normalized and normalized.endswith(".kt"):
+        return True, "禁止修改 BuildConfig 生成逻辑"
+    if "encrypt" in normalized.lower() and "key" in normalized.lower():
+        return True, "禁止修改加密密钥相关文件"
+    return False, ""
+
+
 def apply_code_changes(claude_output: str):
     """解析 Claude 输出中的 === FILE: path === 块，写入文件系统"""
     lines = claude_output.splitlines()
     i = 0
     applied = []
+    blocked = []
     while i < len(lines):
         match = FILE_MARKER.match(lines[i])
         if match:
@@ -517,11 +750,29 @@ def apply_code_changes(claude_output: str):
                 print(f"[APPLY SKIP] 非法路径 (路径遍历): {file_path}")
                 i += 1
                 continue
+            # 安全黑名单校验
+            is_blocked, reason = _is_blocked_path(file_path)
+            if is_blocked:
+                print(f"[APPLY BLOCKED] {file_path} | {reason}")
+                blocked.append((file_path, reason))
+                i += 1
+                continue
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text("\n".join(content_lines), encoding="utf-8")
             applied.append(file_path)
             print(f"[APPLY] {file_path}")
         i += 1
+
+    # 如果有被拦截的文件，记录到安全审计日志
+    if blocked:
+        security_log = PROJECT_ROOT / "AICodeAgent" / "data" / "security_violations.log"
+        security_log.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().isoformat()
+        with security_log.open("a", encoding="utf-8") as f:
+            for bp, br in blocked:
+                f.write(f"[{timestamp}] BLOCKED: {bp} | {br}\n")
+        print(f"[SECURITY] {len(blocked)} 个文件被拦截，详见 security_violations.log")
+
     return applied
 
 
@@ -641,8 +892,70 @@ def _extract_committable_files(workspace: Path) -> list[str]:
     return result
 
 
-def git_commit(task_id: str, workspace: Path):
-    """只提交 consensus.md 中列出的文件，避免污染人工临时改动"""
+DEPENDENCY_FILES = [
+    "gradle/libs.versions.toml",
+    "build.gradle.kts",
+    "app/build.gradle.kts",
+    "app/build.gradle",
+    "sport/build.gradle.kts",
+    "sport/build.gradle",
+    "buildSrc/build.gradle.kts",
+    "buildSrc/build.gradle",
+    "site-caps-ksp/build.gradle.kts",
+    "theme-registry-ksp/build.gradle.kts",
+]
+
+
+def _check_dependency_diff(base_branch: str) -> tuple[bool, str]:
+    """
+    检查依赖文件是否有变更。返回 (是否有新增依赖, 变更摘要)。
+    如果有变更但 consensus.md 未明确批准，则视为违规。
+    """
+    changed = []
+    for dep_file in DEPENDENCY_FILES:
+        full = PROJECT_ROOT / dep_file
+        if not full.exists():
+            continue
+        # 获取 base branch 上的版本
+        ret, base_content, _ = run_cmd(
+            ["git", "show", f"{base_branch}:{dep_file}"],
+            capture=True,
+        )
+        if ret != 0:
+            # base branch 可能无此文件，视为新增
+            base_content = ""
+        current_content = full.read_text(encoding="utf-8")
+        if base_content != current_content:
+            changed.append(dep_file)
+
+    if not changed:
+        return False, ""
+
+    summary = f"检测到依赖文件变更: {', '.join(changed)}"
+    return True, summary
+
+
+def git_commit(task_id: str, workspace: Path, base_branch: str = ""):
+    """只提交 consensus.md 中列出的文件，避免污染人工临时改动；提交前检查依赖变更"""
+    # 依赖变更检测
+    dep_changed, dep_summary = _check_dependency_diff(base_branch or get_current_branch())
+    if dep_changed:
+        consensus = workspace / "consensus.md"
+        approved = False
+        if consensus.exists():
+            text = consensus.read_text(encoding="utf-8").lower()
+            # consensus 中需明确提及新依赖/第三方库/依赖变更
+            if any(k in text for k in ("新依赖", "第三方库", "依赖", "新增库", "引入库")):
+                approved = True
+        if not approved:
+            violation_msg = (
+                f"[DEP BLOCK] 依赖变更未在 consensus.md 中明确批准。\n{dep_summary}\n"
+                "请在 consensus.md 中补充对新依赖的说明后重试，或降级为 L2 人工核准。"
+            )
+            print(violation_msg)
+            (workspace / "dependency_violation.md").write_text(violation_msg, encoding="utf-8")
+            raise RuntimeError("dependency_change_not_approved")
+
     files = _extract_committable_files(workspace)
     if not files:
         print("[GIT WARN] consensus.md 中无文件清单，回退到 git add -A")
@@ -664,11 +977,27 @@ def git_commit(task_id: str, workspace: Path):
     run_cmd(["git", "commit", "-m", f"feat: automated implementation [agent-{task_id}]"])
 
 
+def _detect_dependency_violation(workspace: Path) -> str:
+    """在 apply_code_changes 后扫描是否有被拦截的依赖文件被修改（兜底检测）"""
+    # 检查工作区 git diff 中是否包含依赖文件
+    ret, diff_out, _ = run_cmd(
+        ["git", "diff", "--name-only"],
+        capture=True,
+    )
+    if ret != 0:
+        return ""
+    changed = [line.strip() for line in diff_out.splitlines() if line.strip()]
+    for dep_file in DEPENDENCY_FILES:
+        if dep_file in changed:
+            return f"[DEP VIOLATION] {dep_file} 被修改但未经共识批准"
+    return ""
+
+
 def git_push(branch: str):
     run_cmd(["git", "push", "origin", branch])
 
 
-def create_pr(task_id: str, requirement: str, branch: str, base_branch: str = "") -> str:
+def create_pr(task_id: str, requirement: str, branch: str, base_branch: str = "", deviation_report: str = "") -> str:
     ret, _, _ = run_cmd(["gh", "--version"], capture=True)
     if ret != 0:
         return ""
@@ -683,6 +1012,8 @@ def create_pr(task_id: str, requirement: str, branch: str, base_branch: str = ""
 - [x] `./gradlew lintDebug` PASS
 > 自动生成，请 Review 后 Merge
 """
+    if deviation_report and deviation_report.strip():
+        body += f"\n### Consensus Deviation Audit\n{deviation_report}\n"
     ret, stdout, _ = run_cmd(
         ["gh", "pr", "create", "--title", title, "--body", body, "--base", base, "--head", branch],
         capture=True
@@ -1020,6 +1351,59 @@ def _validate_site_awareness(workspace: Path, task: Task) -> list[str]:
     return warnings
 
 
+def _generate_consensus_deviation(workspace: Path, task: Task) -> str:
+    """编码后审计：对比 consensus.md 承诺 vs 实际修改，生成 deviation report"""
+    consensus_path = workspace / "consensus.md"
+    promised_files: set[str] = set()
+    if consensus_path.exists():
+        promised_files = set(_extract_consensus_file_paths(workspace))
+
+    actual_files: set[str] = set()
+    base = task.base_branch or "main"
+    ret, diff_out, _ = run_cmd(
+        ["git", "diff", "--name-only", base],
+        capture=True,
+    )
+    if ret == 0:
+        actual_files = {line.strip() for line in diff_out.splitlines() if line.strip()}
+
+    missing = promised_files - actual_files
+    extra = actual_files - promised_files
+    lines: list[str] = []
+
+    if missing:
+        lines.append("### ⚠️ 未完成的共识文件")
+        for f in sorted(missing):
+            lines.append(f"- [ ] {f} （consensus 中提及但未修改）")
+        lines.append("")
+
+    if extra:
+        lines.append("### ⚠️ 超出共识范围的修改")
+        for f in sorted(extra):
+            lines.append(f"- [ ] {f} （实际修改但 consensus 未提及）")
+        lines.append("")
+
+    sw_path = workspace / "site_warnings.md"
+    if sw_path.exists():
+        lines.append("### 🏷️ Site 感知警告")
+        lines.append(sw_path.read_text(encoding="utf-8"))
+        lines.append("")
+
+    dep_violation = _detect_dependency_violation(workspace)
+    if dep_violation:
+        lines.append("### 🔒 依赖变更警告")
+        lines.append(dep_violation)
+        lines.append("")
+
+    if not lines:
+        lines.append("✅ 编码结果与 consensus 一致，无偏差。")
+
+    report = "\n".join(lines)
+    (workspace / "consensus_deviation.md").write_text(report, encoding="utf-8")
+    print(f"[AUDIT] consensus_deviation.md: {len(missing)} missing, {len(extra)} extra")
+    return report
+
+
 def run_coding_build_pr(task: Task, ws: Path):
     """编码 → Gradle → git → PR（L2 核准后或 L0/L1 辩论完成后执行）"""
     # 编码前 site 校验
@@ -1044,10 +1428,23 @@ def run_coding_build_pr(task: Task, ws: Path):
         file_key=file_key,
         merge_existing_map=asset_map,
     )
+    site_switched = False
     if effective_en:
-        switch_site_if_needed(effective_en)
+        site_switched = switch_site_if_needed(effective_en)
     elif task.site_hint:
-        switch_site_if_needed(task.site_hint)
+        site_switched = switch_site_if_needed(task.site_hint)
+
+    # 如果发生了 site 切换，首次构建前执行 clean，避免增量编译携带旧 site 缓存
+    if site_switched:
+        print("[BUILD] Site switched, running gradle clean first...")
+        clean_code, clean_out, clean_err = run_cmd(
+            ["./gradlew", "clean", "--console=plain"],
+            timeout=BUILD_TIMEOUT,
+        )
+        if clean_code != 0:
+            print(f"[BUILD WARN] gradle clean failed: {clean_err[:500]}")
+        else:
+            print("[BUILD] gradle clean done")
 
     if not task.branch:
         base_branch = task.base_branch or get_current_branch()
@@ -1114,12 +1511,15 @@ def run_coding_build_pr(task: Task, ws: Path):
         initial_prompt = build_fix_prompt(task.raw_requirement, errors, attempt + 2)
         print(f"[CORRECT] Retry {attempt + 2} with fix prompt")
 
+    # 编码后审计：对比 consensus 与实际修改
+    deviation_report = _generate_consensus_deviation(ws, task)
+
     transition(task.task_id, State.GIT_COMMITTING, "build passed")
     git_commit(task.task_id, ws)
     git_push(task.branch)
 
     transition(task.task_id, State.CREATING_PR, "pushed")
-    pr_url = create_pr(task.task_id, task.raw_requirement, task.branch, task.base_branch)
+    pr_url = create_pr(task.task_id, task.raw_requirement, task.branch, task.base_branch, deviation_report)
     task.pr_url = pr_url
     save_task(task)
 
@@ -1146,10 +1546,58 @@ def _snapshot_git_state() -> tuple[str, list[tuple[str, str]]]:
     return current_branch, snapshot
 
 
+def _has_uncommitted_work() -> bool:
+    """检测工作区是否存在未提交的 tracked 文件修改（排除纯 untracked）"""
+    _, status_out, _ = run_cmd(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        capture=True,
+    )
+    for line in status_out.splitlines():
+        if len(line) >= 3:
+            status = line[:2]
+            # M, A, D, R, C 表示 tracked 文件有变更；?? 表示 untracked
+            if status != "??":
+                return True
+    return False
+
+
 def _restore_task_environment(task: Task, original_branch: str, snapshot: list[tuple[str, str]], original_configs: str):
-    """任务结束后恢复环境：切回 base branch、删除 agent 分支、恢复 Configs.kt、清理 untracked 残留"""
+    """任务结束后恢复环境：切回 base branch、删除 agent 分支、恢复 Configs.kt、清理 untracked 残留。
+    安全模式：检测到人工未提交更改时，拒绝 stash/checkout/drop，降级为软清理。"""
     print(f"[CLEANUP] Restoring environment after task {task.task_id}")
     base = task.base_branch or original_branch or "main"
+
+    # 安全模式检查：如果存在非 untracked 的未提交修改，可能是人工正在编辑
+    if _has_uncommitted_work():
+        print("[CLEANUP SAFETY] Detected uncommitted work — skipping destructive stash/checkout/drop.")
+        print("[CLEANUP SAFETY] Manual cleanup may be required for the following files:")
+        _, status_out, _ = run_cmd(
+            ["git", "status", "--short"],
+            capture=True,
+        )
+        for line in status_out.splitlines():
+            print(f"  {line}")
+
+        # 软清理：仅恢复 Configs.kt（site 切换可能修改了它）
+        configs = PROJECT_ROOT / "buildSrc" / "src" / "main" / "kotlin" / "Configs.kt"
+        if configs.exists() and original_configs:
+            current = configs.read_text(encoding="utf-8")
+            if current != original_configs:
+                configs.write_text(original_configs, encoding="utf-8")
+                print("[CLEANUP] Restored Configs.kt")
+
+        # 尝试删除本地 agent 分支（如果存在且不是当前分支）
+        agent_branch = task.branch
+        if agent_branch:
+            _, branch_out, _ = run_cmd(["git", "branch", "--show-current"], capture=True)
+            if branch_out.strip() != agent_branch:
+                run_cmd(["git", "branch", "-D", agent_branch])
+                print(f"[CLEANUP] Removed agent branch {agent_branch}")
+            else:
+                print(f"[CLEANUP SAFETY] Cannot remove current branch {agent_branch}; please switch manually")
+
+        print("[CLEANUP] Soft cleanup done — environment NOT fully restored due to uncommitted work")
+        return
 
     # 1. 先 stash 当前未提交的更改（防止 checkout 失败），然后切回 base branch
     run_cmd(["git", "stash", "push", "--include-untracked", "-m", f"agent-cleanup-{task.task_id}"])

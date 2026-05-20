@@ -26,7 +26,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 POLL_TIMEOUT = 30
 
 sys.path.insert(0, str(PROJECT_ROOT / "AICodeAgent" / "orchestrator"))
-from state_machine import init_db, save_task, get_task, Task, transition, State, approve_gate_resume
+from state_machine import init_db, save_task, get_task, Task, transition, State, approve_gate_resume, cancel_task
 from platform_figma import resolve_platform_site
 
 
@@ -146,6 +146,23 @@ def handle_command(message):
         else:
             send_message(f"任务 {tid} 不存在或不处于 waiting_gate 状态", chat_id=chat_id)
 
+    elif cmd == "/cancel":
+        tid = arg.strip()
+        if not tid:
+            send_message("用法: /cancel <task_id>", chat_id=chat_id)
+            return
+        task = get_task(tid)
+        if not task:
+            send_message(f"未找到任务 {tid}", chat_id=chat_id)
+            return
+        if task.current_state in (State.COMPLETED.value, State.FAILED.value, State.CANCELLED.value):
+            send_message(f"任务 {tid} 已结束，无需取消", chat_id=chat_id)
+            return
+        if cancel_task(tid, reason="user cancelled via telegram"):
+            send_message(f"✅ 任务 <code>{tid}</code> 已取消", chat_id=chat_id)
+        else:
+            send_message(f"❌ 取消任务 {tid} 失败", chat_id=chat_id)
+
     elif cmd == "/help":
         send_message(
             "<b>Android Headless Agent V3</b>\n"
@@ -154,6 +171,7 @@ def handle_command(message):
             "/status <task_id> 查询状态\n"
             "/history 最近任务\n"
             "/continue <task_id> L2 核准\n"
+            "/cancel <task_id> 取消任务\n"
             "/help 显示帮助",
             chat_id=chat_id
         )
