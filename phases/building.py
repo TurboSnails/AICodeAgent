@@ -13,7 +13,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from engine.exceptions import AgentRecoverableError, BuildFailureError
+from utils.config_loader import cfg_bool
 from utils.logging_config import get_logger
+from utils.project_guides import read_build_policy
 from engine.state_machine import State, Task, save_task
 from phases.base import PhaseHandler, PhaseResult
 
@@ -38,7 +40,12 @@ class BuildingHandler(PhaseHandler):
             raise AgentRecoverableError("BuildService not available")
 
         try:
-            success, log = self._build.build(task.task_id, workspace)
+            success, log = self._build.build(
+                task.task_id,
+                workspace,
+                level=task.level,
+                requirement=task.raw_requirement,
+            )
         except BuildFailureError as e:
             # 构建失败，解析错误并生成修正提示
             errors = self._build.parse_errors(str(e))
@@ -58,6 +65,16 @@ class BuildingHandler(PhaseHandler):
 
         if success:
             logger.info("Build passed for %s", task.task_id)
+            policy = read_build_policy(workspace)
+            if task.level == "L0" and (
+                (policy and policy.assemble_only)
+                or not cfg_bool("features.self_review_for_l0", False)
+            ):
+                return PhaseResult(
+                    State.GIT_COMMITTING,
+                    "L0 compile-only build passed, skip review pipeline",
+                    {"build_log": log},
+                )
             return PhaseResult(
                 State.SELF_REVIEW,
                 "build passed",

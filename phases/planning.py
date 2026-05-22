@@ -24,6 +24,9 @@ from utils.logging_config import get_logger
 from engine.state_machine import State, Task, save_task, transition
 from phases.base import PhaseHandler, PhaseResult
 from services.request_classifier import RequestClassifier
+from utils.phase_status import write_phase_status
+from utils.memory_context import load_memory_recall_from_workspace
+from utils.project_guides import resolve_build_policy, write_build_policy_files
 
 logger = get_logger(__name__)
 from utils.paths import PROJECT_ROOT
@@ -66,9 +69,15 @@ class PlanningHandler(PhaseHandler):
             task.level = self._auto_level(task.raw_requirement)
             save_task(task)
 
-        # 2. [新增] 请求类型分类
-        if not task.request_type or task.request_type == "code":
-            classifier = RequestClassifier()
+        # 2. 请求类型分类（澄清续跑跳过，避免再次 LLM 分类卡住）
+        if task.resume_after_clarification or "[用户澄清]" in task.raw_requirement:
+            if not task.request_type:
+                task.request_type = "code"
+                save_task(task)
+            logger.info("Task %s skip re-classify (clarification already in requirement)", task.task_id)
+        elif not task.request_type or task.request_type == "code":
+            write_phase_status(workspace, "planning", "正在进行 LLM 路由分类…")
+            classifier = RequestClassifier(ai_client=self._ai)
             result = classifier.classify_with_fallback(task.raw_requirement, task.level)
             task.request_type = result.request_type
             save_task(task)
@@ -77,11 +86,15 @@ class PlanningHandler(PhaseHandler):
                 task.task_id, task.request_type, result.confidence,
             )
 
-        # 3. 生成需求文档（除非已澄清续跑且文件已存在）
+        # 3. 构建验收策略（CLAUDE.md → AGENTS.md，早于需求文档与 building）
+        if not task.resume_after_clarification or not (workspace / "build_policy.json").exists():
+            self._write_build_policy(task, workspace)
+
+        # 4. 生成需求文档（含 build_policy 摘要，供后续 AI 阅读）
         if not task.resume_after_clarification or not (workspace / "requirement.md").exists():
             self._generate_docs(task, workspace)
 
-        # 4. 准备资产上下文（除非已澄清续跑且文件已存在）
+        # 5. 准备资产上下文（除非已澄清续跑且文件已存在）
         if not task.resume_after_clarification or not (workspace / "asset_analysis.json").exists():
             self._prepare_asset_context(task, workspace)
 
@@ -93,35 +106,62 @@ class PlanningHandler(PhaseHandler):
 
         # 6. [新增] 根据 request_type 路由到不同路径
         if task.request_type == "explain":
+            self._clear_resume_clarification(task)
             return PhaseResult(State.DIRECT_ANSWER, "explain request — skip coding pipeline")
 
         if task.request_type == "design_only":
+            self._clear_resume_clarification(task)
             return PhaseResult(State.ARCHITECT_PLANNING, "design request — skip debate/consensus")
 
         if task.request_type == "review_only":
             self._bootstrap_review_consensus(task, workspace)
+            self._clear_resume_clarification(task)
             return PhaseResult(State.CODEX_REVIEW, "review_only — skip coding/building")
 
         # 7. 原有 CODE_REQUEST 路径：L0 快速路径跳过辩论
         if task.level == "L0":
             logger.info("L0 fast path — skip debate/consensus")
             self._bootstrap_l0_consensus(task, workspace)
+            self._clear_resume_clarification(task)
             return PhaseResult(State.CODING, "L0 fast path")
 
         # 8. 正常路径 -> 辩论
-        return PhaseResult(State.DEBATING, "planning complete")
+        result = PhaseResult(State.DEBATING, "planning complete")
+        self._clear_resume_clarification(task)
+        return result
+
+    @staticmethod
+    def _clear_resume_clarification(task: Task) -> None:
+        if task.resume_after_clarification:
+            task.resume_after_clarification = 0
+            save_task(task)
 
     # ------------------------------------------------------------------
     # 子步骤实现
     # ------------------------------------------------------------------
 
+    def _write_build_policy(self, task: Task, workspace: Path) -> None:
+        policy = resolve_build_policy(task.raw_requirement, level=task.level)
+        write_build_policy_files(workspace, policy)
+        logger.info(
+            "Build policy for %s: %s (assemble_only=%s)",
+            task.task_id,
+            policy.verify_command,
+            policy.assemble_only,
+        )
+
     def _generate_docs(self, task: Task, workspace: Path) -> None:
         """生成 requirement.md"""
         has_figma = any(kw in task.raw_requirement.lower() for kw in FIGMA_KEYWORDS)
+        policy_path = workspace / "build_policy.md"
+        build_section = ""
+        if policy_path.exists():
+            build_section = f"\n## Build Verification (from project guides)\n{policy_path.read_text(encoding='utf-8')[:1500]}\n"
         lines = [
             f"# Requirement\n\n{task.raw_requirement}\n",
             f"\n## Meta\n- Level: {task.level}\n- Site: {task.site_hint or 'unspecified'}\n",
             f"- Figma involved: {'yes' if has_figma else 'no'}\n",
+            build_section,
         ]
         (workspace / "requirement.md").write_text("".join(lines), encoding="utf-8")
         logger.info("Generated requirement.md for %s", task.task_id)
@@ -152,15 +192,19 @@ class PlanningHandler(PhaseHandler):
         questions: list[str] = []
 
         # 缺少目标页面/模块
-        if not re.search(r"(screen|page|fragment|activity|view|页面|界面|模块)", req):
+        if not re.search(
+            r"(screen|page|fragment|activity|view|页面|界面|模块|vippager|vip.?pager)",
+            req,
+            re.I,
+        ):
             questions.append("目标页面/模块是什么？")
 
         # 缺少站点信息
-        if not task.site_hint and not re.search(r"(site|站点|全站|所有站点)", req):
+        if not task.site_hint and not re.search(r"(site|站点|全站|所有站点|全站点)", req):
             questions.append("目标站点（enName）是什么，还是全站生效？")
 
         # 缺少验收标准
-        if not re.search(r"(验收|测试|标准|验证|expect|should|must)", req):
+        if not re.search(r"(验收|测试|标准|验证|编译|build|expect|should|must)", req, re.I):
             questions.append("验收标准或期望行为是什么？")
 
         # L0 明确小改豁免

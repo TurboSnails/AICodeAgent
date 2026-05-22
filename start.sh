@@ -72,12 +72,24 @@ else
 fi
 
 echo "[CHECK] 所有依赖检查通过"
+
+# --- TencentDB Agent Memory Gateway（config/local.yaml enabled 时建议运行）---
+if command -v memory-tencentdb-ctl &>/dev/null; then
+    if memory-tencentdb-ctl health &>/dev/null; then
+        echo "[CHECK] TencentDB memory gateway OK (127.0.0.1:8420)"
+    else
+        echo "[START] TencentDB memory gateway..."
+        memory-tencentdb-ctl start 2>/dev/null || echo "[WARN] memory gateway 启动失败，任务将降级无记忆"
+    fi
+else
+    echo "[WARN] memory-tencentdb-ctl 未在 PATH，跳过记忆 Gateway（见 README TencentDB 章节）"
+fi
 echo ""
 
 # --- 创建目录 ---
 mkdir -p "$DATA_DIR" "$PID_DIR" "$LOG_DIR" "$PROJECT_ROOT/workspace" "$PROJECT_ROOT/data/db"
 
-# --- 停止旧进程 ---
+# --- 停止旧进程（含孤儿 executor，避免占锁导致任务永远 pending）---
 if [ -d "$PID_DIR" ]; then
     for pidfile in "$PID_DIR"/*.pid; do
         [ -f "$pidfile" ] || continue
@@ -90,6 +102,18 @@ if [ -d "$PID_DIR" ]; then
         rm -f "$pidfile"
     done
 fi
+if command -v fuser >/dev/null 2>&1 && [ -f "$DATA_DIR/executor.lock" ]; then
+    orphan=$(fuser "$DATA_DIR/executor.lock" 2>/dev/null | tr -d ' ')
+    if [ -n "$orphan" ] && kill -0 "$orphan" 2>/dev/null; then
+        echo "[STOP] Killing orphan executor on lock (PID $orphan)"
+        kill "$orphan" 2>/dev/null || true
+        sleep 1
+        kill -9 "$orphan" 2>/dev/null || true
+    fi
+fi
+pkill -f "$PROJECT_ROOT/engine/runner.py" 2>/dev/null || true
+echo "" > "$DATA_DIR/executor.current_task" 2>/dev/null || true
+sleep 1
 
 # --- 启动 Web UI Gateway ---
 echo "[START] Web UI Gateway (port 6789)..."

@@ -18,24 +18,47 @@ Web UI 网关 — V4 重构适配器
 
 from __future__ import annotations
 
+import fcntl
 import http.server
 import json
 import mimetypes
 import os
 import re
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from engine.state_machine import get_task_state_history
+from engine.state_machine import (
+    DB_FILE,
+    State,
+    get_task_state_history,
+    _connect,
+    _row_to_task,
+)
 from utils.config_loader import cfg_str
 from utils.logging_config import get_logger
+from utils.request_logger import log_request
 from services.task_service import TaskService
+from utils.paths import DATA_DIR, WORKSPACE_ROOT
+from utils.phase_status import read_phase_status
 
 logger = get_logger(__name__)
 from utils.paths import PROJECT_ROOT
 
 # 静态文件根目录
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# Executor 运行时文件（用于判断是否有执行器在跑）
+LOCK_FILE = DATA_DIR / "executor.lock"
+CURRENT_TASK_FILE = DATA_DIR / "executor.current_task"
+
+# 判定为垃圾任务的空闲阈值（秒）
+ORPHAN_IDLE_THRESHOLD = 600  # 10 分钟
+
+# 终态与等待态
+_TERMINAL_STATES = {"completed", "failed", "cancelled"}
+_WAITING_STATES = {"waiting_gate", "waiting_clarification"}
 
 
 def _auth_ok(headers: dict[str, str]) -> bool:
@@ -114,115 +137,267 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path
+        with log_request(self, logger) as ctx:
+            parsed = urlparse(self.path)
+            path = parsed.path
 
-        if path == "/":
-            self.send_response(301)
-            self.send_header("Location", "/static/index.html")
-            self.end_headers()
-            return
+            if path == "/":
+                self.send_response(301)
+                self.send_header("Location", "/static/index.html")
+                self.end_headers()
+                ctx.status = 301
+                return
 
-        if path == "/health":
-            self._json({"status": "ok", "version": "v4"})
-            return
+            if path == "/health":
+                self._json({"status": "ok", "version": "v4"})
+                ctx.status = 200
+                return
 
-        if path == "/tasks":
-            tasks = self._task_service.list_tasks(limit=50)
-            self._json({"tasks": [_task_to_dict(t) for t in tasks]})
-            return
+            if path == "/api/orphan-tasks":
+                result = _detect_orphan_tasks()
+                self._json(result)
+                ctx.status = 200
+                return
 
-        m = re.match(r"/task/([a-zA-Z0-9_-]+)/history", path)
-        if m:
-            task_id = m.group(1)
-            history = get_task_state_history(task_id)
-            self._json({"task_id": task_id, "history": history})
-            return
+            if path == "/tasks":
+                tasks = self._task_service.list_tasks(limit=50)
+                self._json({"tasks": [_task_to_dict(t) for t in tasks]})
+                ctx.status = 200
+                return
 
-        m = re.match(r"/task/([a-zA-Z0-9_-]+)", path)
-        if m:
-            task_id = m.group(1)
-            task = self._task_service.get_task(task_id)
-            if task:
-                self._json({"task": _task_to_dict(task)})
-            else:
-                self._json({"error": "task not found"}, 404)
-            return
+            m = re.match(r"/task/([a-zA-Z0-9_-]+)/history", path)
+            if m:
+                task_id = m.group(1)
+                history = get_task_state_history(task_id)
+                self._json({"task_id": task_id, "history": history})
+                ctx.status = 200
+                return
 
-        # 静态文件服务
-        if path.startswith("/static/"):
-            self._serve_static(path[len("/static/"):])
-            return
+            m = re.match(r"/task/([a-zA-Z0-9_-]+)", path)
+            if m:
+                task_id = m.group(1)
+                task = self._task_service.get_task(task_id)
+                if task:
+                    self._json({"task": _task_to_dict(task)})
+                    ctx.status = 200
+                else:
+                    self._json({"error": "task not found"}, 404)
+                    ctx.status = 404
+                return
 
-        self._json({"error": "not found"}, 404)
+            # 静态文件服务
+            if path.startswith("/static/"):
+                self._serve_static(path[len("/static/"):])
+                ctx.status = 200
+                return
+
+            self._json({"error": "not found"}, 404)
+            ctx.status = 404
 
     # ------------------------------------------------------------------
     # POST
     # ------------------------------------------------------------------
 
     def do_POST(self) -> None:
-        if not _auth_ok(dict(self.headers)):
-            self._json({"error": "unauthorized"}, 401)
-            return
-
-        parsed = urlparse(self.path)
-        path = parsed.path
-
-        # 提交任务
-        if path == "/api/task":
-            payload = self._read_body()
-            requirement = (payload.get("requirement") or "").strip()
-            if not requirement:
-                self._json({"error": "requirement is required"}, 400)
+        with log_request(self, logger) as ctx:
+            if not _auth_ok(dict(self.headers)):
+                self._json({"error": "unauthorized"}, 401)
+                ctx.status = 401
                 return
-            level = payload.get("level", "auto")
-            site_hint = payload.get("site_hint", "")
-            source = payload.get("source", "web")
-            chat_id = payload.get("chat_id", "")
-            request_type = payload.get("request_type", "")
-            task = self._task_service.submit_task(
-                requirement=requirement,
-                level=level,
-                site_hint=site_hint,
-                source=source,
-                chat_id=chat_id,
-                request_type=request_type,
-            )
-            self._json({"task_id": task.task_id, "level": task.level, "status": task.status, "request_type": task.request_type})
-            return
 
-        # L2 核准
-        m = re.match(r"/api/continue/([a-zA-Z0-9_-]+)", path)
-        if m:
-            task_id = m.group(1)
-            ok = self._task_service.approve_gate(task_id)
-            self._json({"success": ok, "task_id": task_id})
-            return
+            parsed = urlparse(self.path)
+            path = parsed.path
 
-        # 需求澄清回复
-        m = re.match(r"/api/reply/([a-zA-Z0-9_-]+)", path)
-        if m:
-            task_id = m.group(1)
-            payload = self._read_body()
-            reply = (payload.get("reply") or "").strip()
-            if not reply:
-                self._json({"error": "reply is required"}, 400)
+            # 提交任务
+            if path == "/api/task":
+                payload = self._read_body()
+                requirement = (payload.get("requirement") or "").strip()
+                if not requirement:
+                    self._json({"error": "requirement is required"}, 400)
+                    ctx.status = 400
+                    return
+                level = payload.get("level", "auto")
+                site_hint = payload.get("site_hint", "")
+                source = payload.get("source", "web")
+                chat_id = payload.get("chat_id", "")
+                request_type = payload.get("request_type", "")
+                task = self._task_service.submit_task(
+                    requirement=requirement,
+                    level=level,
+                    site_hint=site_hint,
+                    source=source,
+                    chat_id=chat_id,
+                    request_type=request_type,
+                )
+                self._json({"task_id": task.task_id, "level": task.level, "status": task.status, "request_type": task.request_type})
+                ctx.status = 200
                 return
-            ok = self._task_service.submit_clarification(task_id, reply)
-            self._json({"success": ok, "task_id": task_id})
-            return
 
-        # 取消任务
-        m = re.match(r"/api/cancel/([a-zA-Z0-9_-]+)", path)
-        if m:
-            task_id = m.group(1)
-            payload = self._read_body()
-            reason = payload.get("reason", "user cancelled")
-            ok = self._task_service.cancel(task_id, reason)
-            self._json({"success": ok, "task_id": task_id})
-            return
+            # L2 核准
+            m = re.match(r"/api/continue/([a-zA-Z0-9_-]+)", path)
+            if m:
+                task_id = m.group(1)
+                ok = self._task_service.approve_gate(task_id)
+                self._json({"success": ok, "task_id": task_id})
+                ctx.status = 200 if ok else 400
+                return
 
-        self._json({"error": "not found"}, 404)
+            # 需求澄清回复
+            m = re.match(r"/api/reply/([a-zA-Z0-9_-]+)", path)
+            if m:
+                task_id = m.group(1)
+                payload = self._read_body()
+                reply = (payload.get("reply") or "").strip()
+                if not reply:
+                    self._json({"error": "reply is required"}, 400)
+                    ctx.status = 400
+                    return
+                ok = self._task_service.submit_clarification(task_id, reply)
+                self._json({"success": ok, "task_id": task_id})
+                ctx.status = 200 if ok else 400
+                return
+
+            # 取消任务
+            m = re.match(r"/api/cancel/([a-zA-Z0-9_-]+)", path)
+            if m:
+                task_id = m.group(1)
+                payload = self._read_body()
+                reason = payload.get("reason", "user cancelled")
+                ok = self._task_service.cancel(task_id, reason)
+                self._json({"success": ok, "task_id": task_id})
+                ctx.status = 200 if ok else 400
+                return
+
+            # 清理（强制失败）垃圾任务
+            m = re.match(r"/api/cleanup/([a-zA-Z0-9_-]+)", path)
+            if m:
+                task_id = m.group(1)
+                ok = _cleanup_orphan_task(task_id)
+                self._json({"success": ok, "task_id": task_id})
+                ctx.status = 200 if ok else 400
+                return
+
+            self._json({"error": "not found"}, 404)
+            ctx.status = 404
+
+
+# ------------------------------------------------------------------
+# 孤儿任务检测与清理
+# ------------------------------------------------------------------
+
+
+def _is_executor_running() -> tuple[bool, str]:
+    """检测 executor 是否在运行，返回 (是否运行, 当前处理的任务ID)"""
+    if not LOCK_FILE.exists():
+        return False, ""
+    try:
+        fd = os.open(str(LOCK_FILE), os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # 能拿到锁说明没有 executor 在跑
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            return False, ""
+        except BlockingIOError:
+            os.close(fd)
+            # 拿不到锁，说明 executor 在跑
+            current_task = ""
+            if CURRENT_TASK_FILE.exists():
+                current_task = CURRENT_TASK_FILE.read_text(encoding="utf-8").strip()
+            return True, current_task
+    except OSError:
+        return False, ""
+
+
+def _parse_iso_datetime(iso_str: str) -> datetime | None:
+    """解析 ISO 格式时间字符串"""
+    if not iso_str:
+        return None
+    try:
+        # 处理带 Z 和不带 Z 的情况
+        s = iso_str.replace("Z", "+00:00")
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _detect_orphan_tasks() -> dict:
+    """检测垃圾任务：非终态、非等待态、长时间未更新的任务"""
+    executor_running, current_task_id = _is_executor_running()
+
+    conn = _connect()
+    cursor = conn.execute(
+        "SELECT * FROM task_queue WHERE current_state NOT IN (?, ?, ?)",
+        tuple(_TERMINAL_STATES),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    orphans = []
+    now = datetime.now(timezone.utc)
+
+    for row in rows:
+        state = row["current_state"]
+        task_id = row["task_id"]
+
+        # 等待态不算垃圾
+        if state in _WAITING_STATES:
+            continue
+
+        # pending 不算垃圾（正常排队）
+        if state == "pending":
+            continue
+
+        # executor 正在跑且当前处理的就是这个任务，不算垃圾
+        if executor_running and task_id == current_task_id:
+            continue
+
+        # 检查更新时间
+        updated = _parse_iso_datetime(row["updated_at"] or "")
+        if updated is None:
+            updated = _parse_iso_datetime(row["created_at"] or "") or now
+
+        # 统一为 UTC 进行比较
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+
+        idle_seconds = int((now - updated).total_seconds())
+
+        # executor 没在跑：所有非终态非等待态都是垃圾
+        # executor 在跑：超过阈值才算垃圾
+        is_orphan = not executor_running or idle_seconds >= ORPHAN_IDLE_THRESHOLD
+
+        if is_orphan:
+            orphans.append({
+                "task_id": task_id,
+                "current_state": state,
+                "raw_requirement": (row["raw_requirement"] or "")[:80],
+                "level": row["level"] or "",
+                "updated_at": row["updated_at"] or "",
+                "created_at": row["created_at"] or "",
+                "idle_seconds": idle_seconds,
+                "idle_minutes": idle_seconds // 60,
+            })
+
+    return {
+        "executor_running": executor_running,
+        "current_task_id": current_task_id,
+        "orphan_count": len(orphans),
+        "orphans": orphans,
+    }
+
+
+def _cleanup_orphan_task(task_id: str) -> bool:
+    """将垃圾任务强制流转到 failed"""
+    from engine.state_machine import cancel_task, get_task
+
+    task = get_task(task_id)
+    if not task:
+        return False
+    if task.current_state in _TERMINAL_STATES:
+        return False
+    # 使用 cancel 而不是直接改状态，保持审计历史
+    return cancel_task(task_id, reason="orphan cleanup via web ui")
 
 
 # ------------------------------------------------------------------
@@ -230,7 +405,179 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 # ------------------------------------------------------------------
 
 
+_ARTIFACT_BY_REQUEST_TYPE: dict[str, list[tuple[str, str]]] = {
+    "explain": [("answer", "answer.md")],
+    "design_only": [("design", "design.md")],
+    "review_only": [("review", "codex_review.md"), ("review", "requirement_review.md")],
+}
+_ARTIFACT_FALLBACK: list[tuple[str, str]] = [
+    ("answer", "answer.md"),
+    ("design", "design.md"),
+    ("review", "codex_review.md"),
+    ("consensus", "consensus.md"),
+]
+_ARTIFACT_TITLES = {
+    "answer": "AI 回答",
+    "design": "设计方案",
+    "review": "审查报告",
+    "consensus": "共识文档",
+}
+_ARTIFACT_MAX_FULL = 200_000
+_ARTIFACT_MAX_PREVIEW = 600
+
+
+_CODE_PROGRESS: dict[str, int] = {
+    "pending": 0,
+    "planning": 5,
+    "waiting_clarification": 5,
+    "debating": 15,
+    "consensus": 25,
+    "architect_planning": 35,
+    "waiting_gate": 40,
+    "direct_answer": 0,  # explain 流水线会覆盖
+    "design_output": 0,
+    "coding": 50,
+    "building": 60,
+    "self_review": 70,
+    "codex_review": 75,
+    "architect_review": 80,
+    "red_team_review": 85,
+    "requirement_review": 90,
+    "correcting": 55,
+    "git_committing": 95,
+    "creating_pr": 97,
+    "notifying": 98,
+    "completed": 100,
+    "failed": 100,
+    "cancelled": 100,
+}
+
+_PIPELINE_PROGRESS: dict[str, dict[str, int]] = {
+    "explain": {
+        "pending": 0,
+        "planning": 20,
+        "waiting_clarification": 10,
+        "direct_answer": 75,
+        "completed": 100,
+        "failed": 100,
+        "cancelled": 100,
+    },
+    "design_only": {
+        "pending": 0,
+        "planning": 15,
+        "architect_planning": 45,
+        "design_output": 85,
+        "waiting_clarification": 10,
+        "completed": 100,
+        "failed": 100,
+        "cancelled": 100,
+    },
+    "review_only": {
+        "pending": 0,
+        "planning": 15,
+        "consensus": 30,
+        "codex_review": 60,
+        "architect_review": 70,
+        "red_team_review": 80,
+        "requirement_review": 90,
+        "completed": 100,
+        "failed": 100,
+        "cancelled": 100,
+    },
+}
+
+
+def _failed_at_state(task_id: str, terminal: str) -> str:
+    """终态失败/取消时，取进入终态前的阶段（供进度条锚点）。"""
+    if terminal not in ("failed", "cancelled"):
+        return ""
+    for entry in reversed(get_task_state_history(task_id)):
+        if entry.get("to_state") == terminal:
+            return entry.get("from_state") or ""
+    return ""
+
+
+def _progress_for_task(task) -> int:
+    """按 request_type 选用短流水线进度，避免 explain 在 direct_answer 显示 0%。"""
+    rt = getattr(task, "request_type", "code") or "code"
+    st = task.current_state
+    if st in ("failed", "cancelled"):
+        anchor = _failed_at_state(task.task_id, st) or "building"
+        pipeline = _PIPELINE_PROGRESS.get(rt)
+        if pipeline and anchor in pipeline:
+            return pipeline[anchor]
+        return _CODE_PROGRESS.get(anchor, _CODE_PROGRESS.get(st, 0))
+    pipeline = _PIPELINE_PROGRESS.get(rt)
+    if pipeline and st in pipeline:
+        return pipeline[st]
+    return _CODE_PROGRESS.get(st, 0)
+
+
+def _load_task_artifact(task) -> dict:
+    """读取工作区产物（explain → answer.md 等），供 Web 展示。"""
+    if task.current_state != "completed":
+        return {}
+
+    ws = WORKSPACE_ROOT / task.task_id
+    if not ws.is_dir():
+        return {}
+
+    rt = getattr(task, "request_type", "code") or "code"
+    candidates = list(_ARTIFACT_BY_REQUEST_TYPE.get(rt, [])) + _ARTIFACT_FALLBACK
+    seen: set[str] = set()
+
+    for kind, filename in candidates:
+        if filename in seen:
+            continue
+        seen.add(filename)
+        path = ws / filename
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            logger.debug("read artifact %s failed: %s", path, e)
+            continue
+        if not text:
+            continue
+
+        preview = text[:_ARTIFACT_MAX_PREVIEW]
+        if len(text) > _ARTIFACT_MAX_PREVIEW:
+            preview += "…"
+
+        return {
+            "artifact_type": kind,
+            "artifact_title": _ARTIFACT_TITLES.get(kind, "输出"),
+            "artifact_content": text[:_ARTIFACT_MAX_FULL],
+            "artifact_preview": preview,
+            "artifact_truncated": len(text) > _ARTIFACT_MAX_FULL,
+        }
+
+    return {}
+
+
 def _task_to_dict(task) -> dict:
+    """将 Task 对象转为 JSON 字典，同时读取工作区的澄清问题（如果存在）"""
+    # 尝试读取 clarification_questions.md（waiting_clarification 状态用）
+    questions = []
+    if task.current_state == "waiting_clarification":
+        cq_path = WORKSPACE_ROOT / task.task_id / "clarification_questions.md"
+        try:
+            if cq_path.exists():
+                text = cq_path.read_text(encoding="utf-8")
+                # 简单解析 Markdown 列表：提取 "1. xxx" 或 "- xxx" 行
+                for line in text.splitlines():
+                    m = re.match(r"^\s*(?:\d+\.\s+|[-*]\s+)(.+)", line)
+                    if m:
+                        questions.append(m.group(1).strip())
+        except Exception:
+            pass
+
+    progress = _progress_for_task(task)
+    artifact = _load_task_artifact(task)
+    phase = _load_task_activity(task)
+    failed_at = _failed_at_state(task.task_id, task.current_state)
+
     return {
         "task_id": task.task_id,
         "raw_requirement": task.raw_requirement,
@@ -250,7 +597,108 @@ def _task_to_dict(task) -> dict:
         "gate_deadline": task.gate_deadline,
         "clarification_deadline": task.clarification_deadline,
         "request_type": getattr(task, "request_type", "code"),
+        "clarification_questions": questions,
+        "progress": progress,
+        "failed_at_state": failed_at,
+        **phase,
+        **artifact,
     }
+
+
+_ACTIVITY_PREVIEW_MAX = 900
+
+
+def _load_phase_detail(task) -> dict:
+    """读取工作区 phase_status.json，供 Web 展示当前子步骤。"""
+    ws = WORKSPACE_ROOT / task.task_id
+    data = read_phase_status(ws)
+    if not data:
+        return {}
+    detail = str(data.get("detail", "")).strip()
+    updated = str(data.get("updated_at", "")).strip()
+    extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
+    hint = str(extra.get("hint", "")).strip() if extra else ""
+    phase_detail = detail
+    if hint and hint not in detail:
+        phase_detail = f"{detail} — {hint}" if detail else hint
+    return {
+        "phase_status_state": str(data.get("state", "")),
+        "phase_detail": phase_detail,
+        "phase_updated_at": updated,
+        "phase_extra": extra,
+    }
+
+
+def _sanitize_cli_feedback(text: str, *, max_lines: int = 16) -> str:
+    """Web 展示用 CLI 日志：去掉超长 cmd 行，保留最近若干行。"""
+    if not text:
+        return ""
+    lines: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("cmd:") and len(line) > 240:
+            line = line[:200].rstrip() + f" … (truncated, total {len(line)} chars)"
+        lines.append(line)
+    return "\n".join(lines[-max_lines:])
+
+
+def _load_task_activity(task) -> dict:
+    """阶段说明 + 诊断 / Claude 输出摘要（进行中与失败时尤其有用）。"""
+    result = _load_phase_detail(task)
+    ws = WORKSPACE_ROOT / task.task_id
+    if not ws.is_dir():
+        return result
+
+    extra = result.get("phase_extra") or {}
+    if isinstance(extra, dict):
+        cli_tail = str(extra.get("cli_log_tail", "")).strip()
+        cli_status = str(extra.get("cli_status", "")).strip()
+        cli_running = extra.get("cli_running")
+        cli_pid = extra.get("cli_pid")
+        if cli_tail or cli_status or cli_pid:
+            result["cli_feedback"] = _sanitize_cli_feedback(cli_tail)
+            result["cli_status"] = cli_status
+            result["cli_running"] = bool(cli_running)
+            result["cli_pid"] = cli_pid
+        log_path = ws / "coding_cli.log"
+        if log_path.is_file():
+            try:
+                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                tail = "\n".join(lines[-12:])
+                if tail and not result.get("cli_feedback"):
+                    result["cli_feedback"] = _sanitize_cli_feedback(tail)
+                if result.get("cli_running") is None and task.current_state == "coding":
+                    result["cli_running"] = True
+                    result.setdefault("cli_status", "running")
+            except OSError:
+                pass
+
+    snippets: list[str] = []
+    diag_path = ws / "coding_apply_diag.json"
+    if diag_path.is_file():
+        try:
+            diag = json.loads(diag_path.read_text(encoding="utf-8"))
+            if isinstance(diag, dict):
+                markers = diag.get("file_markers_found")
+                applied = diag.get("applied_count")
+                if markers is not None:
+                    snippets.append(f"解析: 发现 {markers} 个 FILE 块，已写入 {applied} 个文件")
+                if diag.get("hint"):
+                    snippets.append(str(diag["hint"]))
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    out_path = ws / "last_claude_output.md"
+    if out_path.is_file():
+        try:
+            text = out_path.read_text(encoding="utf-8").strip()
+            if text:
+                snippets.append(text[:_ACTIVITY_PREVIEW_MAX] + ("…" if len(text) > _ACTIVITY_PREVIEW_MAX else ""))
+        except OSError:
+            pass
+
+    if snippets:
+        result["ai_output_preview"] = "\n".join(snippets)
+    return result
 
 
 # 兼容旧版入口：直接运行此文件时启动 HTTP 服务器

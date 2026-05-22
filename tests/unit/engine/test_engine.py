@@ -10,7 +10,7 @@ import pytest
 
 from engine.core import AgentEngine
 from engine.exceptions import AgentFatalError, AgentRecoverableError
-from engine.state_machine import State, Task, init_db, get_task, transition, save_task
+from engine.state_machine import State, Task, cancel_task, init_db, get_task, transition, save_task
 from phases.base import PhaseHandler, PhaseResult
 
 class DummyHandler(PhaseHandler):
@@ -192,6 +192,38 @@ class TestEngineExceptionHandling:
         loaded = get_task("fat1")
         assert loaded is not None
         assert loaded.current_state == State.FAILED.value
+
+    def test_cancelled_task_stops_engine(self, temp_db, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr("engine.state_machine.DB_FILE", temp_db, raising=False)
+        init_db()
+
+        class SlowHandler(PhaseHandler):
+            def __init__(self):
+                self.calls = 0
+
+            def handle(self, task: Task, workspace: Path, **kwargs) -> PhaseResult:
+                self.calls += 1
+                if self.calls == 1:
+                    cancel_task(task.task_id, "user")
+                return PhaseResult(State.BUILDING, "next")
+
+        engine = AgentEngine(workspace_root=tmp_path)
+        engine.register(State.CODING, SlowHandler())
+        engine.register(State.BUILDING, DummyHandler(State.COMPLETED))
+
+        task = Task(
+            task_id="cx1", raw_requirement="test", level="L0",
+            site_hint="", source="test", chat_id="",
+        )
+        task.current_state = State.CODING.value
+        save_task(task)
+
+        engine.process_task(task)
+
+        loaded = get_task("cx1")
+        assert loaded.current_state == "cancelled"
+        assert engine.get_handler(State.CODING).calls == 1
+
 
 class TestEngineHooks:
     """生命周期钩子"""

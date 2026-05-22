@@ -12,8 +12,11 @@ const STATE_LABEL = {
   planning: '规划中',
   debating: '方案讨论',
   consensus: '达成共识',
+  architect_planning: '架构规划',
   waiting_gate: '待你确认',
   waiting_clarification: '待你回复',
+  direct_answer: '生成回答',
+  design_output: '输出方案',
   coding: '正在编码',
   building: '正在构建',
   self_review: '自审查',
@@ -30,7 +33,18 @@ const STATE_LABEL = {
   cancelled: '已取消',
 };
 
+const REQUEST_TYPE_LABEL = {
+  explain: '问答',
+  review_only: '审查',
+  design_only: '方案',
+  code: '编码',
+};
+
 function stateLabel(s) { return STATE_LABEL[s] || s; }
+function requestTypeLabel(rt) {
+  if (!rt || rt === 'code') return '';
+  return REQUEST_TYPE_LABEL[rt] || rt;
+}
 
 function pillClass(state) {
   if (WAIT.has(state)) return 'pill-wait';
@@ -258,6 +272,18 @@ async function continueTask(id) {
   loadTasks();
 }
 
+function fillReply(id, idx) {
+  const waiting = _prevTasks.filter(t => WAIT.has(t.current_state));
+  const task = waiting.find(t => t.task_id === id);
+  if (!task || !task.clarification_questions || !task.clarification_questions[idx]) return;
+  const el = document.getElementById('r-' + id);
+  if (!el) return;
+  const q = task.clarification_questions[idx];
+  const current = el.value.trim();
+  el.value = current ? current + '\n' + q : q;
+  el.focus();
+}
+
 async function replyTask(id) {
   const el = document.getElementById('r-' + id);
   if (!el || !el.value.trim()) {
@@ -303,12 +329,23 @@ function renderActionCards(tasks) {
   area.hidden = false;
   if (empty) empty.hidden = true;
   $('actionCount').textContent = waiting.length;
+
+  // 若用户正在 waiting_clarification 输入框中打字，跳过重新渲染，避免 DOM 重建打断 IME 组合
+  const active = document.activeElement;
+  if (active && active.tagName === 'INPUT' && active.id && active.id.startsWith('r-')) {
+    return;
+  }
+
   $('actionList').innerHTML = waiting.map(t => {
     const isGate = t.current_state === 'waiting_gate';
+    const questionsHtml = !isGate && Array.isArray(t.clarification_questions) && t.clarification_questions.length
+      ? `<div class="clarification-questions"><strong>AI 的疑问（点击直接填入）：</strong><ol>${t.clarification_questions.map((q, i) => `<li class="cq-item" onclick="fillReply('${t.task_id}', ${i})" title="点击填入输入框">${escapeHtml(q)}</li>`).join('')}</ol></div>`
+      : '';
     return `<div class="action-card">
       <div class="action-card-title">${isGate ? '需要你确认方案' : '需要你补充说明'}</div>
       <div class="action-card-meta">${t.task_id} · ${fmtFullTime(t.created_at)}</div>
       <div class="action-card-body">${escapeHtml(t.raw_requirement)}</div>
+      ${questionsHtml}
       <div class="action-card-footer">
         ${isGate
           ? `<button type="button" class="btn btn-confirm-inline btn-sm" onclick="continueTask('${t.task_id}')">确认并继续</button>`
@@ -333,6 +370,19 @@ function renderTaskItem(t) {
     actions += (actions ? ' ' : '') + `<button type="button" class="btn btn-secondary btn-sm" onclick="cancelTask('${t.task_id}')">取消</button>`;
   }
   const pr = t.pr_url ? ` <a href="${escapeHtml(t.pr_url)}" target="_blank" rel="noopener" class="text-sm">查看 PR</a>` : '';
+  const artifactBlock = (st === 'completed' && t.artifact_preview)
+    ? `<div class="task-artifact">
+        <div class="task-artifact-label">${escapeHtml(t.artifact_title || 'AI 输出')}</div>
+        <div class="artifact-preview">${escapeHtml(t.artifact_preview)}</div>
+        <a class="artifact-link" href="/static/task.html?id=${t.task_id}">查看全文 →</a>
+      </div>`
+    : '';
+
+  const prog = typeof t.progress === 'number' ? t.progress : 0;
+  const progColor = st === 'completed' ? 'var(--green)' : st === 'failed' || st === 'cancelled' ? 'var(--red)' : 'var(--primary)';
+  const progBar = `<div class="task-progress"><div class="task-progress-bar" style="width:${prog}%;background:${progColor}"></div><span class="task-progress-text">${prog}%</span></div>`;
+  const activityBlock = typeof renderActivityBlock === 'function'
+    ? renderActivityBlock(t, DONE) : '';
 
   return `<article class="task-item${highlight ? ' is-highlight' : ''}${faded ? ' is-faded' : ''}">
     <div class="task-status-icon ${iconBoxClass(st)}">${statusIcon(st)}</div>
@@ -340,9 +390,13 @@ function renderTaskItem(t) {
       <div class="task-top">
         <a class="task-title" href="/static/task.html?id=${t.task_id}">${t.task_id}</a>
         <span class="pill pill-level">${t.level}</span>
+        ${requestTypeLabel(t.request_type) ? `<span class="pill pill-type">${requestTypeLabel(t.request_type)}</span>` : ''}
         <span class="pill ${pillClass(st)}">${stateLabel(st)}</span>
       </div>
       <p class="task-req-text">${escapeHtml(t.raw_requirement || '（无描述）')}</p>
+      ${activityBlock}
+      ${artifactBlock}
+      ${progBar}
       <div class="task-foot">
         <span class="task-time">${fmtTime(t.created_at)}</span>${pr}
       </div>
@@ -415,6 +469,103 @@ async function loadTasks() {
   list.innerHTML = tasks.map(renderTaskItem).join('');
 }
 
+/* ---------- 垃圾任务监控 ---------- */
+
+let _orphanData = { orphans: [], executor_running: false, current_task_id: '' };
+
+async function checkOrphanTasks() {
+  try {
+    const data = await api('GET', '/api/orphan-tasks');
+    _orphanData = data || { orphans: [], executor_running: false, current_task_id: '' };
+    updateOrphanUI(data);
+  } catch (e) {
+    console.warn('orphan check failed', e);
+  }
+}
+
+function updateOrphanUI(data) {
+  const btn = $('orphanBtn');
+  const dot = $('orphanDot');
+  const badge = $('orphanBadge');
+  const label = $('orphanLabel');
+  if (!btn) return;
+
+  const count = data.orphan_count || 0;
+  badge.textContent = count;
+
+  if (count > 0) {
+    btn.classList.add('alert');
+    label.textContent = '🧹 有垃圾任务';
+  } else {
+    btn.classList.remove('alert');
+    label.textContent = '🧹 垃圾任务';
+  }
+}
+
+function openOrphanModal() {
+  $('orphanModal').classList.add('show');
+  renderOrphanList();
+}
+
+function closeOrphanModal() {
+  $('orphanModal').classList.remove('show');
+}
+
+function renderOrphanList() {
+  const body = $('orphanModalBody');
+  if (!body) return;
+
+  const orphans = _orphanData.orphans || [];
+  if (!orphans.length) {
+    body.innerHTML = '<p class="orphan-empty">暂无垃圾任务 👍</p>';
+    return;
+  }
+
+  const executorRunning = _orphanData.executor_running || false;
+  const executorHtml = `<div class="executor-status ${executorRunning ? 'ok' : 'warn'}">
+    <span class="dot"></span>${executorRunning ? '执行器运行中' : '执行器未运行'}
+  </div>`;
+
+  const listHtml = orphans.map(t => {
+    const idleText = t.idle_minutes >= 60
+      ? `${Math.floor(t.idle_minutes / 60)}小时${t.idle_minutes % 60}分钟`
+      : `${t.idle_minutes}分钟`;
+    return `<div class="orphan-item">
+      <div class="orphan-item-info">
+        <div>
+          <span class="orphan-item-id">${t.task_id}</span>
+          <span class="orphan-item-state">${stateLabel(t.current_state)}</span>
+        </div>
+        <div class="orphan-item-req">${escapeHtml(t.raw_requirement)}</div>
+        <div class="orphan-item-meta">空闲 ${idleText} · ${fmtFullTime(t.updated_at)}</div>
+      </div>
+      <button type="button" class="btn btn-danger btn-sm" onclick="cleanupOrphan('${t.task_id}')">清理</button>
+    </div>`;
+  }).join('');
+
+  body.innerHTML = executorHtml + '<div class="orphan-list">' + listHtml + '</div>';
+}
+
+async function cleanupOrphan(taskId) {
+  showConfirm(
+    '确认清理',
+    '将任务 <b>' + taskId + '</b> 标记为失败并释放资源。确定吗？',
+    '确定清理',
+    'btn-danger',
+    async () => {
+      const res = await api('POST', '/api/cleanup/' + taskId);
+      toast(res.success ? '已清理 ' + taskId : '清理失败', res.success);
+      if (res.success) {
+        await checkOrphanTasks();
+        renderOrphanList();
+        loadTasks();
+      }
+    }
+  );
+}
+
+/* ---------- 初始化 ---------- */
+
 $('req').addEventListener('input', () => {
   autoResizeTextarea($('req'));
   updateSubmitButton();
@@ -431,7 +582,9 @@ initTabs();
 initMainTabs();
 checkHealth();
 loadTasks();
+checkOrphanTasks();
 updateSubmitButton();
 updateLevelHint();
-setInterval(loadTasks, 3000);
+setInterval(loadTasks, 2000);
 setInterval(checkHealth, 30000);
+setInterval(checkOrphanTasks, 10000);

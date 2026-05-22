@@ -16,6 +16,22 @@ if [ ! -d "$PID_DIR" ]; then
     exit 0
 fi
 
+# 孤儿 executor：占 executor.lock 但不在 pid 文件（会导致新任务永远排队）
+if command -v fuser >/dev/null 2>&1 && [ -f "$DATA_DIR/executor.lock" ]; then
+    orphan=$(fuser "$DATA_DIR/executor.lock" 2>/dev/null | tr -d ' ')
+    if [ -n "$orphan" ]; then
+        echo "[STOP] orphan executor holding lock (PID $orphan)"
+        kill "$orphan" 2>/dev/null || true
+        sleep 1
+        kill -9 "$orphan" 2>/dev/null || true
+    fi
+fi
+pkill -f "$PROJECT_ROOT/engine/runner.py" 2>/dev/null || true
+# 取消/超时后常残留的 headless claude --print（占 Kimi 并发）
+pkill -f "claude -p" 2>/dev/null || true
+pkill -f "claude --print" 2>/dev/null || true
+echo "" > "$DATA_DIR/executor.current_task" 2>/dev/null || true
+
 for pidfile in "$PID_DIR"/*.pid; do
     [ -f "$pidfile" ] || continue
     name=$(basename "$pidfile" .pid)

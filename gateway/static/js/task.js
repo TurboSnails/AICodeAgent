@@ -35,14 +35,17 @@ function escapeHtml(s) {
 
 const STATE_LABEL = {
   pending: '排队中', planning: '规划中', debating: '方案讨论', consensus: '达成共识',
-  waiting_gate: '待你确认', waiting_clarification: '待你回复',
+  architect_planning: '架构规划', waiting_gate: '待你确认', waiting_clarification: '待你回复',
+  direct_answer: '生成回答', design_output: '输出方案',
   coding: '正在编码', building: '正在构建',
   self_review: '自审查', codex_review: '代码审查', architect_review: '架构评审',
   red_team_review: '安全审查', requirement_review: '需求审查',
   correcting: '修复中', git_committing: '提交代码', creating_pr: '创建 PR',
   notifying: '发送通知', completed: '已完成', failed: '失败', cancelled: '已取消',
 };
+const REQUEST_TYPE_LABEL = { explain: '问答', review_only: '审查', design_only: '方案', code: '编码' };
 function stateLabel(s) { return STATE_LABEL[s] || s; }
+function requestTypeLabel(rt) { return (!rt || rt === 'code') ? '' : (REQUEST_TYPE_LABEL[rt] || rt); }
 function fmtFullTime(iso) {
   if (!iso) return '-';
   const d = new Date(iso);
@@ -94,50 +97,82 @@ async function cancelTask(id) {
 }
 
 /* ---------- 进度条 ---------- */
-const PHASE_ORDER = [
+const PHASE_ORDER_CODE = [
   'pending', 'planning', 'debating', 'consensus',
-  'coding', 'building', 'codex_review', 'red_team_review',
+  'coding', 'building', 'correcting', 'self_review', 'codex_review',
+  'architect_review', 'red_team_review',
   'requirement_review', 'git_committing', 'creating_pr',
-  'notifying', 'completed'
+  'notifying', 'completed',
 ];
 const PHASE_LABELS = {
-  pending: '队列',
-  planning: '规划',
-  debating: '辩论',
-  consensus: '共识',
-  coding: '编码',
-  building: '构建',
-  codex_review: '逻辑审查',
-  red_team_review: '红队审查',
-  requirement_review: '需求审查',
-  git_committing: 'Git提交',
-  creating_pr: '创建PR',
-  notifying: '通知',
-  completed: '完成'
+  pending: '队列', planning: '规划', debating: '辩论', consensus: '共识',
+  architect_planning: '架构', direct_answer: '回答', design_output: '方案',
+  coding: '编码', building: '构建', correcting: '修复',
+  self_review: '自审', codex_review: '逻辑审查', architect_review: '架构评审',
+  red_team_review: '红队', requirement_review: '需求审查',
+  git_committing: '提交', creating_pr: 'PR', notifying: '通知', completed: '完成',
 };
+const TERMINAL_PROGRESS = new Set(['completed', 'failed', 'cancelled']);
 
-function renderProgress(currentState, isFailed) {
+function progressAnchor(state, history, failedAtState) {
+  if (!TERMINAL_PROGRESS.has(state)) return state;
+  if (failedAtState && PHASE_ORDER_CODE.includes(failedAtState)) return failedAtState;
+  if (!history || !history.length) return state === 'completed' ? 'completed' : 'building';
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i];
+    if (h.to_state === state && h.from_state) return h.from_state;
+  }
+  return state === 'completed' ? 'completed' : 'building';
+}
+
+function workflowPhases(requestType) {
+  switch (requestType) {
+    case 'explain':
+      return ['pending', 'planning', 'direct_answer', 'completed'];
+    case 'design_only':
+      return ['pending', 'planning', 'architect_planning', 'design_output', 'completed'];
+    case 'review_only':
+      return ['pending', 'planning', 'consensus', 'codex_review', 'requirement_review', 'completed'];
+    default:
+      return PHASE_ORDER_CODE;
+  }
+}
+
+function renderProgress(task, history) {
   const track = $('progressTrack');
   if (!track) return;
 
-  const idx = PHASE_ORDER.indexOf(currentState);
+  const currentState = task.current_state;
+  const isTerminalFail = currentState === 'failed' || currentState === 'cancelled';
+  const phaseOrder = workflowPhases(task.request_type || 'code');
+  const anchor = progressAnchor(currentState, history, task.failed_at_state);
+
+  let idx = phaseOrder.indexOf(anchor);
   if (idx < 0) {
-    track.innerHTML = '<span class="text-muted">暂无进度信息</span>';
+    track.innerHTML = '<span class="text-muted">当前：' + escapeHtml(stateLabel(currentState))
+      + (anchor !== currentState ? '（' + escapeHtml(stateLabel(anchor)) + '）' : '') + '</span>';
     return;
   }
 
   const parts = [];
-  for (let i = 0; i < PHASE_ORDER.length; i++) {
-    const s = PHASE_ORDER[i];
-    const label = PHASE_LABELS[s] || s;
+  for (let i = 0; i < phaseOrder.length; i++) {
+    const s = phaseOrder[i];
+    const label = PHASE_LABELS[s] || stateLabel(s);
     let cls = '';
     if (i < idx) cls = 'done';
-    else if (i === idx) cls = isFailed ? 'failed' : 'active';
+    else if (i === idx) {
+      if (currentState === 'completed') cls = 'done';
+      else if (isTerminalFail) cls = 'failed';
+      else cls = 'active';
+    }
 
     parts.push(`<div class="progress-step ${cls}"><div class="progress-dot"></div><div class="progress-label">${label}</div></div>`);
-    if (i < PHASE_ORDER.length - 1) {
+    if (i < phaseOrder.length - 1) {
       parts.push(`<div class="progress-line ${i < idx ? 'done' : ''}"></div>`);
     }
+  }
+  if (isTerminalFail) {
+    parts.push(`<div class="progress-hint text-muted text-sm">终态：${escapeHtml(stateLabel(currentState))}</div>`);
   }
   track.innerHTML = parts.join('');
 }
@@ -145,7 +180,18 @@ function renderProgress(currentState, isFailed) {
 /* ---------- 详情网格 ---------- */
 function renderDetailGrid(task) {
   const grid = $('detailGrid');
-  const items = [
+  const items = [];
+  if (task.artifact_content) {
+    const truncatedNote = task.artifact_truncated
+      ? '<p class="text-muted text-sm">内容过长，仅展示前 20 万字符</p>'
+      : '';
+    items.push({
+      k: task.artifact_title || 'AI 回答',
+      v: truncatedNote + '<div class="artifact-full"><pre>' + escapeHtml(task.artifact_content) + '</pre></div>',
+      fullWidth: true,
+    });
+  }
+  items.push(
     { k: '任务 ID', v: task.task_id },
     { k: '需求描述', v: task.raw_requirement },
     { k: '任务等级', v: task.level },
@@ -157,13 +203,84 @@ function renderDetailGrid(task) {
     { k: '创建时间', v: fmtFullTime(task.created_at) },
     { k: '更新时间', v: fmtFullTime(task.updated_at) },
     { k: '状态', v: '<span class="' + badgeClass(task.current_state) + '">' + stateLabel(task.current_state) + '</span>' },
-  ];
+  );
+  // 展示 AI 提出的澄清问题
+  if (task.clarification_questions && task.clarification_questions.length) {
+    const qList = task.clarification_questions.map((q, i) => '<li>' + (i + 1) + '. ' + escapeHtml(q) + '</li>').join('');
+    items.push({ k: '待澄清问题', v: '<ol>' + qList + '</ol>' });
+  }
+  if (task.phase_detail && typeof renderActivityBlock !== 'function') {
+    items.push({
+      k: '当前步骤',
+      v: '<div class="phase-detail-box">' + escapeHtml(task.phase_detail)
+        + (task.phase_updated_at ? '<div class="text-muted text-sm">' + fmtFullTime(task.phase_updated_at) + '</div>' : '')
+        + '</div>',
+    });
+  }
+  if (task.ai_output_preview && typeof renderActivityBlock !== 'function') {
+    items.push({
+      k: 'AI 输出摘要',
+      v: '<pre class="activity-ai-preview">' + escapeHtml(task.ai_output_preview) + '</pre>',
+      fullWidth: true,
+    });
+  }
   if (task.error_log) {
     items.push({ k: '错误日志', v: '<pre>' + escapeHtml(task.error_log) + '</pre>' });
   }
+  // 进度条
+  const prog = typeof task.progress === 'number' ? task.progress : 0;
+  const progColor = task.current_state === 'completed' ? 'var(--green)' : ['failed','cancelled'].includes(task.current_state) ? 'var(--red)' : 'var(--primary)';
+  const progHtml = '<div class="detail-progress"><div class="detail-progress-bar" style="width:' + prog + '%;background:' + progColor + '"></div><span>' + prog + '%</span></div>';
+  items.push({ k: '工作流进度', v: progHtml });
+
   grid.innerHTML = items.map(it =>
-    '<div class="detail-item"><div class="detail-key">' + it.k + '</div><div class="detail-val">' + it.v + '</div></div>'
+    '<div class="detail-item' + (it.fullWidth ? ' detail-item-full' : '') + '"><div class="detail-key">' + it.k + '</div><div class="detail-val">' + it.v + '</div></div>'
   ).join('');
+}
+
+function captureScrollPreserve(root) {
+  const map = {};
+  if (!root) return map;
+  root.querySelectorAll('[data-scroll-preserve]').forEach(function (el) {
+    map[el.className] = el.scrollTop;
+  });
+  return map;
+}
+
+function restoreScrollPreserve(root, map) {
+  if (!root || !map) return;
+  root.querySelectorAll('[data-scroll-preserve]').forEach(function (el) {
+    if (map[el.className] != null) el.scrollTop = map[el.className];
+  });
+}
+
+let _activityFp = '';
+let _detailGridFp = '';
+
+function renderTaskActivity(task) {
+  const mount = $('activityMount');
+  if (!mount || typeof renderActivityBlock !== 'function') return;
+  const fp = activityFingerprint(task);
+  if (fp === _activityFp) return;
+  const scroll = captureScrollPreserve(mount);
+  const html = renderActivityBlock(task, new Set(['completed', 'failed', 'cancelled']));
+  if (!html) {
+    mount.innerHTML = '';
+    _activityFp = '';
+    return;
+  }
+  mount.innerHTML = '<div class="detail-item detail-item-full"><div class="detail-key">实时进展</div><div class="detail-val">' + html + '</div></div>';
+  restoreScrollPreserve(mount, scroll);
+  _activityFp = fp;
+}
+
+function detailGridFingerprint(task) {
+  return [
+    task.task_id, task.current_state, task.branch, task.pr_url,
+    task.attempt_count, task.progress,
+    (task.clarification_questions || []).join('|'),
+    task.error_log || '',
+  ].join('\u0001');
 }
 
 /* ---------- 时间线 ---------- */
@@ -235,13 +352,22 @@ async function loadTask() {
 
   // 标题和元信息
   $('d-title').textContent = '任务 ' + task.task_id;
-  $('d-meta').innerHTML = '<span class="pill pill-level">' + task.level + '</span> · <span class="pill ' + (task.current_state === 'completed' ? 'pill-done' : 'pill-running') + '">' + stateLabel(task.current_state) + '</span> · ' + fmtFullTime(task.created_at);
+  const typePill = requestTypeLabel(task.request_type)
+    ? ' · <span class="pill pill-type">' + requestTypeLabel(task.request_type) + '</span>' : '';
+  $('d-meta').innerHTML = '<span class="pill pill-level">' + task.level + '</span>' + typePill
+    + ' · <span class="pill ' + (task.current_state === 'completed' ? 'pill-done' : 'pill-running') + '">'
+    + stateLabel(task.current_state) + '</span> · ' + fmtFullTime(task.created_at);
 
   // 进度条
-  renderProgress(task.current_state, task.current_state === 'failed');
+  renderProgress(task, histRes.history || []);
 
-  // 详情
-  renderDetailGrid(task);
+  // 详情（活动区单独刷新，避免轮询闪烁）
+  const dgFp = detailGridFingerprint(task);
+  if (dgFp !== _detailGridFp) {
+    renderDetailGrid(task);
+    _detailGridFp = dgFp;
+  }
+  renderTaskActivity(task);
 
   // 时间线
   renderTimeline(histRes.history || [], task.current_state);

@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-from utils.paths import PROJECT_ROOT, WORKSPACE_ROOT
+from utils.paths import DATA_DIR, PROJECT_ROOT, WORKSPACE_ROOT
 
 from utils.config_loader import cfg_int
 from utils.logging_config import get_logger
@@ -60,11 +60,14 @@ from services.ai_client import AIClient
 from services.build_service import BuildService
 from services.git_service import GitService
 from services.notification_service import NotificationService
+from services.tencent_memory_service import get_memory_service
+from utils.memory_context import write_memory_recall_file
+from utils.task_cancel import clear_active_task, is_task_cancelled, set_active_task
 
 logger = get_logger(__name__)
 
-LOCK_FILE = PROJECT_ROOT / "data" / "executor.lock"
-CURRENT_TASK_FILE = PROJECT_ROOT / "data" / "executor.current_task"
+LOCK_FILE = DATA_DIR / "executor.lock"
+CURRENT_TASK_FILE = DATA_DIR / "executor.current_task"
 
 _shutdown_requested = False
 _current_task_id: str = ""
@@ -231,11 +234,27 @@ def _restore_environment(task: Task, original_branch: str) -> None:
 def process_task_v4(task: Task, engine: AgentEngine) -> None:
     """V4 任务处理：使用 AgentEngine 替代旧版 process_task"""
     global _current_task_id
+    if is_task_cancelled(task.task_id):
+        logger.info("Skip cancelled task %s", task.task_id)
+        return
+
     _current_task_id = task.task_id
+    set_active_task(task.task_id)
     CURRENT_TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
     CURRENT_TASK_FILE.write_text(task.task_id, encoding="utf-8")
 
     ws = create_workspace(task.task_id)
+
+    memory = get_memory_service()
+    if memory.enabled:
+        if not memory.health_ok():
+            logger.warning(
+                "TencentDB memory enabled but gateway unhealthy at %s — recall/capture skipped",
+                memory.gateway_url,
+            )
+        else:
+            recall = memory.recall_for_task(task.task_id, task.raw_requirement)
+            write_memory_recall_file(ws, recall)
 
     # 保存环境快照
     configs_path = PROJECT_ROOT / "buildSrc" / "src" / "main" / "kotlin" / "Configs.kt"
@@ -255,7 +274,15 @@ def process_task_v4(task: Task, engine: AgentEngine) -> None:
                 transition(task.task_id, State.PLANNING, "dequeue", task)
             engine.process_task(task)
     finally:
+        if memory.enabled and memory.health_ok():
+            memory.capture_task_turn(
+                task.task_id,
+                task.raw_requirement,
+                f"[task finished] state={task.current_state}",
+            )
+            memory.task_session_end(task.task_id)
         _current_task_id = ""
+        clear_active_task()
         CURRENT_TASK_FILE.write_text("", encoding="utf-8")
         _restore_environment(task, original_branch)
 
@@ -296,6 +323,11 @@ def run_loop() -> None:
                 continue
 
             task = tasks[0]
+            if is_task_cancelled(task.task_id):
+                logger.info("Skip cancelled pending task %s", task.task_id)
+                time.sleep(0.5)
+                continue
+
             logger.info("=" * 60)
             logger.info("PROCESS %s | %s | %s", task.task_id, task.level, task.raw_requirement[:60])
             logger.info("=" * 60)

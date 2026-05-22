@@ -97,15 +97,19 @@ class TaskService:
         """用户澄清回复（/reply），合并到需求后回到 pending"""
         reply = (reply or "").strip()
         if not reply:
+            logger.warning("submit_clarification: empty reply for %s", task_id)
             return False
         task = get_task(task_id)
         if not task:
             logger.warning("submit_clarification: task %s not found", task_id)
             return False
         if task.current_state != State.WAITING_CLARIFICATION.value:
-            logger.warning("submit_clarification: task %s not in waiting_clarification", task_id)
+            logger.warning("submit_clarification: task %s not in waiting_clarification (current=%s)", task_id, task.current_state)
             return False
-        return approve_clarification_reply(task_id, reply)
+        logger.info("submit_clarification: task %s reply=%s", task_id, reply[:100])
+        ok = approve_clarification_reply(task_id, reply)
+        logger.info("submit_clarification: task %s result=%s", task_id, ok)
+        return ok
 
     # ------------------------------------------------------------------
     # 取消
@@ -113,7 +117,10 @@ class TaskService:
 
     def cancel(self, task_id: str, reason: str = "user cancelled") -> bool:
         """取消任务"""
-        return cancel_task(task_id, reason)
+        logger.info("cancel: task %s reason=%s", task_id, reason)
+        ok = cancel_task(task_id, reason)
+        logger.info("cancel: task %s result=%s", task_id, ok)
+        return ok
 
     # ------------------------------------------------------------------
     # 查询

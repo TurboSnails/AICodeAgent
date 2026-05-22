@@ -16,6 +16,8 @@ from engine.state_machine import State, Task, save_task
 from phases.base import PhaseHandler, PhaseResult
 from utils.config_loader import cfg_bool, cfg_int
 from utils.logging_config import get_logger
+from utils.memory_context import load_memory_recall_from_workspace, prepend_memory_to_parts
+from services.tencent_memory_service import get_memory_service
 
 logger = get_logger(__name__)
 
@@ -47,7 +49,7 @@ class DirectAnswerHandler(PhaseHandler):
         prompt = self._build_prompt(task)
 
         try:
-            timeout = cfg_int("timeouts.agent_single", 300)
+            timeout = cfg_int("timeouts.agent_single", 500)
             answer = self._ai.call(prompt, context=context, timeout=timeout)
 
             if not answer or not answer.strip():
@@ -58,6 +60,10 @@ class DirectAnswerHandler(PhaseHandler):
             answer_path = workspace / "answer.md"
             answer_path.write_text(answer, encoding="utf-8")
             logger.info("Saved answer.md for %s (%d chars)", task.task_id, len(answer))
+
+            get_memory_service().capture_task_turn(
+                task.task_id, task.raw_requirement, answer
+            )
 
             # 通知用户
             if self._notify:
@@ -73,15 +79,16 @@ class DirectAnswerHandler(PhaseHandler):
         """构建回答所需的上下文。"""
         parts = []
 
-        # 项目规范
-        agents_md = workspace.parents[1] / "AGENTS.md"
-        if agents_md.exists():
-            parts.append(agents_md.read_text(encoding="utf-8")[:4000])
+        from utils.project_guides import append_project_guides_to_parts
+
+        append_project_guides_to_parts(parts, max_chars_per_file=4000)
 
         # RAG 上下文（如有）
         rag = workspace / "coding_context.md"
         if rag.exists():
             parts.append(f"\n## RAG Context\n{rag.read_text(encoding='utf-8')[:3000]}")
+
+        prepend_memory_to_parts(parts, load_memory_recall_from_workspace(workspace))
 
         return "\n".join(parts)
 

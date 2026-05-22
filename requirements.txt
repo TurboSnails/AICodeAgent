@@ -8,6 +8,9 @@ pyyaml>=6.0.0
 pytest>=7.0.0
 pytest-cov>=4.0.0
 
+# 可观测性（可选）
+langsmith>=0.1.0
+
 # 代码质量（可选，CI 用）
 # black>=23.0.0
 # mypy>=1.0.0

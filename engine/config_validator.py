@@ -31,7 +31,9 @@ class ConfigRule:
 REQUIRED_RULES = [
     ConfigRule("webhook_secret", required=False, description="HTTP API 认证密钥（可选）"),
     ConfigRule("ai.claude_model", required=False, description="Claude 模型名称（可选，默认系统模型）"),
-    ConfigRule("timeouts.claude_code", required=False, min_value=60, max_value=3600, description="Claude 调用超时（秒）"),
+    ConfigRule("timeouts.llm", required=False, min_value=60, max_value=7200, description="LLM 默认超时（秒）"),
+    ConfigRule("timeouts.claude_code", required=False, min_value=60, max_value=7200, description="Claude 编码超时（秒）"),
+    ConfigRule("timeouts.agent_single", required=False, min_value=60, max_value=7200, description="单 Agent 超时（秒）"),
     ConfigRule("timeouts.build", required=False, min_value=60, max_value=3600, description="Gradle 构建超时（秒）"),
     ConfigRule("timeouts.debate", required=False, min_value=30, max_value=1800, description="Debate 超时（秒）"),
     ConfigRule("retries.coding", required=False, min_value=0, max_value=10, description="编码重试次数"),

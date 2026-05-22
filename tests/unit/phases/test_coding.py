@@ -62,6 +62,8 @@ class Test {}
     def test_no_files_applied_raises_recoverable(self, tmp_path: Path):
         git = MagicMock()
         git.apply_code_changes.return_value = ([], [])
+        git.list_worktree_changed_paths.return_value = []
+        git.partition_changed_paths.return_value = ([], [])
 
         ai = MagicMock()
         ai.call.return_value = "some output without file markers"
@@ -73,7 +75,7 @@ class Test {}
         )
 
         with patch("phases.coding.save_task"):
-            with pytest.raises(AgentRecoverableError, match="No files were applied"):
+            with pytest.raises(AgentRecoverableError, match="FILE"):
                 handler.handle(task, tmp_path)
 
     def test_blocked_files_recorded_but_not_failing(self, tmp_path: Path):

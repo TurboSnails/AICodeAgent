@@ -15,12 +15,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from engine.exceptions import AgentRecoverableError
+from engine.exceptions import AgentFatalError, AgentRecoverableError
 from utils.config_loader import cfg_bool, cfg_int
 from utils.logging_config import get_logger
 from engine.state_machine import State, Task, save_task
 from phases._review_utils import (
-    list_changed_files,
+    list_task_relevant_changed_files,
     parse_codex_verdict,
     workspace_context,
 )
@@ -54,11 +54,22 @@ class SelfReviewHandler(PhaseHandler):
                 "self_review skipped (disabled)",
             )
 
+        # L0 编译验收：跳过自审查（避免把 AICodeAgent 分支脏文件误判为需求变更）
+        if task.level == "L0" and not cfg_bool("features.self_review_for_l0", False):
+            logger.info("L0 task %s — skip self_review (compile-only path)", task.task_id)
+            return PhaseResult(
+                State.CODEX_REVIEW,
+                "L0 compile-only: self_review skipped",
+            )
+
         if self._ai is None:
             raise AgentRecoverableError("SelfReviewHandler missing ai_client")
 
         # 2. 获取变更文件
-        changed_files = list_changed_files(base_branch=task.base_branch or "")
+        changed_files = list_task_relevant_changed_files(
+            task.raw_requirement,
+            base_branch=task.base_branch or "",
+        )
         if not changed_files:
             logger.info("No changed files for %s, skip self review", task.task_id)
             return PhaseResult(State.CODEX_REVIEW, "no changed files, skip self_review")
@@ -132,7 +143,7 @@ class SelfReviewHandler(PhaseHandler):
         )
 
         if self_review_round > self._max_retries:
-            raise AgentRecoverableError(
+            raise AgentFatalError(
                 f"self review max retries exceeded ({self._max_retries})"
             )
 

@@ -9,6 +9,11 @@ class AgentException(Exception):
     pass
 
 
+class TaskCancelledError(AgentException):
+    """用户取消任务；Executor 应停止处理且不写入 correcting/failed"""
+    pass
+
+
 class AgentRecoverableError(AgentException):
     """
     可恢复错误：任务进入 correcting 阶段重试。

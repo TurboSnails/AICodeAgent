@@ -60,3 +60,25 @@ class TestBuildFlow:
             mock_gradle.return_value = (1, "", "Compilation error")
             with pytest.raises(BuildFailureError):
                 service.build("task1", tmp_path)
+
+    def test_assemble_only_skips_tests(self, tmp_path: Path):
+        import json
+        from utils.project_guides import BuildPolicy, write_build_policy_files
+
+        service = BuildService(project_root=tmp_path)
+        policy = BuildPolicy(
+            source="CLAUDE.md",
+            assemble_only=True,
+            gradle_tasks=["app:assembleDebug"],
+        )
+        write_build_policy_files(tmp_path, policy)
+
+        with patch.object(service, "_run_gradle") as mock_gradle:
+            mock_gradle.return_value = (0, "BUILD SUCCESSFUL", "")
+            success, log = service.build("task1", tmp_path, level="L0", requirement="编译正常")
+            assert success is True
+            assert mock_gradle.call_count == 1
+            assert mock_gradle.call_args[0][0] == ["app:assembleDebug", "--console=plain"]
+            log_text = (tmp_path / "build.log").read_text()
+            assert "build policy" in log_text
+            assert json.loads((tmp_path / "build_policy.json").read_text())["assemble_only"] is True

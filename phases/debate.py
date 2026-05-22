@@ -79,7 +79,7 @@ class DebateHandler(PhaseHandler):
             futures = []
             for agent_name, prompt_file, output_name in agents:
                 remaining = max(30, int(deadline - time.time()))
-                per_agent_timeout = min(cfg_int("timeouts.agent_single", 300), remaining)
+                per_agent_timeout = min(cfg_int("timeouts.agent_single", 500), remaining)
                 futures.append(
                     pool.submit(
                         self._run_single_agent,
@@ -140,7 +140,7 @@ class DebateHandler(PhaseHandler):
 
         context = context_file.read_text(encoding="utf-8") if context_file.exists() else ""
         prompt = prompt_file.read_text(encoding="utf-8")
-        output = self._ai.call(prompt, context=context, timeout=cfg_int("timeouts.agent_single", 300))
+        output = self._ai.call(prompt, context=context, timeout=cfg_int("timeouts.agent_single", 500))
 
         if not output.strip():
             logger.error("Architect Only also failed")

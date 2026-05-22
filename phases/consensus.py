@@ -118,7 +118,7 @@ class ConsensusHandler(PhaseHandler):
         max_retry = cfg_int("retries.consensus", 2)
         for attempt in range(max_retry + 1):
             try:
-                output = self._ai.call(prompt, context=context, timeout=cfg_int("timeouts.agent_single", 300))
+                output = self._ai.call(prompt, context=context, timeout=cfg_int("timeouts.agent_single", 500))
                 if output.strip():
                     (workspace / "consensus.md").write_text(output, encoding="utf-8")
                     logger.info("consensus.md generated (%d chars)", len(output))

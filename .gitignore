@@ -10,6 +10,10 @@ __pycache__/
 .Python
 .venv/
 .env
+config/local.yaml
+
+# IDE / 误生成目录
+.idea/
 
 # 安装产物
 dist/

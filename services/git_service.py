@@ -17,11 +17,11 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from engine.exceptions import GitCommandError
-from utils.config_loader import cfg_str
+from utils.config_loader import cfg_bool, cfg_str
 from utils.logging_config import get_logger
 
 logger = get_logger(__name__)
-from utils.paths import PROJECT_ROOT
+from utils.paths import AGENT_ROOT, PROJECT_ROOT
 
 # 安全黑名单：Agent 禁止修改的文件模式
 BLOCKED_PATHS = [
@@ -88,7 +88,12 @@ class GitService:
         base = base_branch or self.get_current_branch()
         branch = f"feature/agent-{task_id}"
         self._run_cmd(["git", "checkout", base])
-        self._run_cmd(["git", "pull", "origin", base])
+        if cfg_bool("git.pull_on_branch_create", False):
+            code, _, err = self._run_cmd(
+                ["git", "pull", "origin", base], timeout=120,
+            )
+            if code != 0:
+                logger.warning("git pull origin %s failed (continuing): %s", base, err.strip())
         self._run_cmd(["git", "checkout", "-b", branch])
         logger.info("Created branch %s from %s", branch, base)
         return branch
@@ -145,6 +150,44 @@ class GitService:
 
         return applied, blocked
 
+    def list_worktree_changed_paths(self) -> list[str]:
+        """返回工作区相对 project_root 的已修改/新增路径（供 CLI Agent 模式落盘校验）。"""
+        code, out, _ = self._run_cmd(["git", "status", "--porcelain"], capture=True)
+        if code != 0:
+            return []
+        paths: list[str] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # XY path 或 XY old -> new
+            parts = line.split(maxsplit=1)
+            if len(parts) < 2:
+                continue
+            path_part = parts[1]
+            if " -> " in path_part:
+                path_part = path_part.split(" -> ", 1)[1]
+            rel = path_part.strip()
+            if rel:
+                paths.append(rel)
+        return paths
+
+    def partition_changed_paths(
+        self, paths: list[str],
+    ) -> Tuple[list[str], list[Tuple[str, str]]]:
+        """将 git status 路径分为可接受与黑名单拦截。"""
+        applied: list[str] = []
+        blocked: list[Tuple[str, str]] = []
+        for rel in paths:
+            is_blocked, reason = self._is_blocked_path(rel)
+            if is_blocked:
+                blocked.append((rel, reason))
+            else:
+                applied.append(rel)
+        if blocked:
+            self._record_security_violations(blocked)
+        return applied, blocked
+
     def _is_blocked_path(self, file_path: str) -> Tuple[bool, str]:
         normalized = file_path.replace("\\", "/")
         for pattern in BLOCKED_PATHS:
@@ -157,7 +200,7 @@ class GitService:
         return False, ""
 
     def _record_security_violations(self, blocked: list[Tuple[str, str]]) -> None:
-        security_log = self.project_root / "AICodeAgent" / "data" / "security_violations.log"
+        security_log = AGENT_ROOT / "data" / "security_violations.log"
         security_log.parent.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().isoformat()
         with security_log.open("a", encoding="utf-8") as f:
@@ -565,7 +608,10 @@ class GitService:
                 capture_output=capture,
                 text=True,
                 timeout=timeout,
-                env={"PATH": os.environ.get("PATH", "")},
+                env={
+            "PATH": os.environ.get("PATH", ""),
+            "GIT_TERMINAL_PROMPT": "0",
+        },
             )
             if capture and result.stdout:
                 logger.debug(result.stdout[-500:])

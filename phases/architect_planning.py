@@ -62,7 +62,7 @@ class ArchitectPlanningHandler(PhaseHandler):
 
         prompt = self._build_prompt(task)
         try:
-            output = self._ai.call(prompt, context=context, timeout=cfg_int("timeouts.agent_single", 300))
+            output = self._ai.call(prompt, context=context, timeout=cfg_int("timeouts.agent_single", 500))
         except Exception as e:
             logger.exception("Architect planning AI call failed: %s", e)
             raise AgentRecoverableError(f"architect_planning AI call failed: {e}")
@@ -99,10 +99,12 @@ class ArchitectPlanningHandler(PhaseHandler):
         """构建 Architect Planning 所需的上下文。"""
         parts = []
 
-        # 项目规范
-        agents_md = PROJECT_ROOT / "AGENTS.md"
-        if agents_md.exists():
-            parts.append(agents_md.read_text(encoding="utf-8")[:6000])
+        from utils.project_guides import append_project_guides_to_parts
+
+        append_project_guides_to_parts(parts, max_chars_per_file=6000)
+        bp = workspace / "build_policy.md"
+        if bp.exists():
+            parts.append(f"\n## Build Policy\n{bp.read_text(encoding='utf-8')[:2000]}")
 
         # Consensus
         consensus = workspace / "consensus.md"

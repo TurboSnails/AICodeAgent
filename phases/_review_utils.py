@@ -18,7 +18,17 @@ from utils.paths import PROJECT_ROOT
 
 
 def list_changed_files(base_branch: str = "") -> List[str]:
-    """当前工作区相对 base 的变更文件列表"""
+    """当前工作区变更（分支提交 + 暂存 + 未暂存），去重保序。"""
+    seen: set[str] = set()
+    files: List[str] = []
+
+    def _add(paths: List[str]) -> None:
+        for p in paths:
+            p = p.strip()
+            if p and p not in seen:
+                seen.add(p)
+                files.append(p)
+
     if base_branch:
         code, out, _ = _run_cmd(
             ["git", "diff", "--name-only", base_branch, "HEAD"],
@@ -26,24 +36,56 @@ def list_changed_files(base_branch: str = "") -> List[str]:
             timeout=60,
         )
         if code == 0 and out.strip():
-            return [ln.strip() for ln in out.splitlines() if ln.strip()]
-    code, out, _ = _run_cmd(
+            _add([ln for ln in out.splitlines() if ln.strip()])
+
+    for args in (
         ["git", "diff", "--name-only", "HEAD"],
-        PROJECT_ROOT,
-        timeout=60,
-    )
-    if code == 0 and out.strip():
-        return [ln.strip() for ln in out.splitlines() if ln.strip()]
+        ["git", "diff", "--name-only", "--cached"],
+    ):
+        code, out, _ = _run_cmd(args, PROJECT_ROOT, timeout=60)
+        if code == 0 and out.strip():
+            _add([ln for ln in out.splitlines() if ln.strip()])
+
     code, out, _ = _run_cmd(
         ["git", "status", "--porcelain=v1"],
         PROJECT_ROOT,
         timeout=60,
     )
-    files = []
-    for line in out.splitlines():
-        if len(line) >= 4:
-            files.append(line[3:].strip())
+    if code == 0:
+        for line in out.splitlines():
+            if len(line) >= 4:
+                _add([line[3:].strip()])
+
     return files
+
+
+def list_task_relevant_changed_files(
+    requirement: str,
+    base_branch: str = "",
+    *,
+    prefer_app: bool = True,
+) -> List[str]:
+    """
+    审查用变更列表：合并工作区变更，并优先展示与 Android 需求相关的 app/ 路径。
+    """
+    all_files = list_changed_files(base_branch)
+    if not prefer_app:
+        return all_files
+
+    req = (requirement or "").lower()
+    vip_hint = "vip" in req.replace(" ", "") or "vippager" in req.replace(" ", "")
+
+    def _score(path: str) -> tuple[int, str]:
+        p = path.lower()
+        if p.startswith("aicodeagent/"):
+            return (2, path)
+        if vip_hint and ("vip" in p or "vippager" in p):
+            return (0, path)
+        if p.startswith("app/"):
+            return (1, path)
+        return (3, path)
+
+    return [p for _, p in sorted((_score(f), f) for f in all_files)]
 
 
 def _run_cmd(cmd: list, cwd: Path, timeout: int = 60) -> Tuple[int, str, str]:

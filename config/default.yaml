@@ -6,30 +6,54 @@
 # 模型与 AI 配置
 # =============================================================================
 ai:
+  # 调用方式（当前仅支持方案一：subprocess 调用本机 claude 命令行，无 HTTP/SDK）
+  transport: subprocess_cli
   # Claude 模型标识（留空表示不指定 --model，由 Claude Code 自行决定）
   # 仅当需要强制覆盖模型时才填写，如 "claude-sonnet-4-6"
   claude_model: ""
-  # Codex CLI 命令前缀（留空则回退 claude --print）
+  # 审查阶段是否尝试 OpenAI Codex CLI；false = 一律 claude --print（与编码相同）
+  use_codex_cli: false
+  # Codex CLI 命令前缀（仅 use_codex_cli=true 时有效）
   codex_cmd: ""
   # Codex 审查超时（秒）
   codex_timeout: 900
+  # CLI 输出：json（推荐，解析 result 字段）| text
+  claude_output_format: json
+  # headless=true：只读/分类（Read,Glob,Grep，无 Edit/Bash）
+  claude_headless_print: true
+  claude_headless_permission_mode: dontAsk
+  claude_headless_tools: "Read,Glob,Grep"
+  claude_headless_max_turns: 5
+  # headless=false：编码 Agent（acceptEdits + Edit，由 CLI 直接改文件）
+  claude_agent_permission_mode: acceptEdits
+  claude_agent_tools: "Read,Edit,Write,Glob,Grep"
+  claude_disallowed_tools: "Bash"
+  claude_max_turns: 15
+
+git:
+  # 创建 agent 分支前是否 git pull（无头环境建议 false，避免凭据弹窗）
+  pull_on_branch_create: false
 
 # =============================================================================
 # 超时配置
 # =============================================================================
 timeouts:
+  # Kimi / claude --print 默认超时（路由、问答、单 Agent 等未单独指定时）
+  llm: 500
   # 三方辩论总超时
-  debate: 600
-  # 单 Agent 调用超时
-  agent_single: 300
+  debate: 1200
+  # 单 Agent 调用超时（辩论子 Agent、consensus 等）
+  agent_single: 500
   # 任务总生命周期超时
   task_total: 7200
   # 需求澄清等待超时（小时）
   clarification_hours: 48
   # Gradle 构建超时
   build: 900
-  # Claude 编码调用超时
-  claude_code: 1800
+  # Claude 编码阶段超时（整文件生成 + 12KB 上下文，Kimi 常 >500s）
+  claude_code: 1200
+  # L0 单文件小改：上下文瘦身，仍可能较慢
+  claude_code_l0: 900
 
 # =============================================================================
 # 重试配置
@@ -43,8 +67,10 @@ retries:
   codex_review: 2
   # 需求验收审查重试次数
   acceptance_review: 2
-  # Claude 编码调用重试次数
+  # Claude 编码调用重试次数（仅空输出/rate limit；超时不再重试）
   claude_code: 2
+  # L0 编码不重试，避免 900s×N 假死
+  claude_code_l0: 0
   # 指数退避基础延迟（秒）
   base_delay: 3.0
 
@@ -106,13 +132,32 @@ escape:
   file_threshold: 10
 
 # =============================================================================
+# TencentDB Agent Memory（需 standalone Gateway，见 README）
+# =============================================================================
+memory:
+  tencentdb:
+    # 总开关；Gateway 未启动时自动降级，不阻塞任务
+    enabled: false
+    gateway_url: "http://127.0.0.1:8420"
+    timeout_sec: 5
+    # 跨任务共享的 session_key（L0~L3 管道按此聚合）
+    session_key: "aicodeagent/wm"
+    recall: true
+    capture: true
+    max_capture_chars: 12000
+
+# =============================================================================
 # 请求分类路由
 # =============================================================================
 routing:
   # 启用请求分类（关闭则所有请求走 CODE_REQUEST 完整流水线）
   enabled: true
-  # 分类器类型: "rule" | "llm" | "hybrid"
-  classifier: "rule"
+  # 分类器: rule=仅关键词 | llm/hybrid=AI 判定（失败回退 rule）
+  classifier: "hybrid"
+  # hybrid 下先走规则快路径（L0 / VIPPager 等），避免每次 planning 都调 LLM
+  rules_first: true
+  # LLM 分类超时（秒）；rules_first 未命中时才调用
+  classification_timeout: 500
   # 置信度阈值，低于此值降级为 CODE_REQUEST
   confidence_threshold: 0.7
   # 各类型是否启用
@@ -124,6 +169,10 @@ routing:
 # 功能开关
 # =============================================================================
 features:
+  # L0 VIPPager 渐变：false = 一律走 Claude Code 真实改码；true = 本地规则 patch（已弃用默认）
+  l0_vippager_deterministic: false
+  # L0 构建通过后跳过 self_review（避免 agent 分支上 AICodeAgent 脏文件导致假 FAIL 死循环）
+  self_review_for_l0: false
   # 跳过需求澄清阶段（调试用）
   skip_clarification: false
   # 启用 Architect Planning 架构规划阶段（默认开启）
@@ -164,3 +213,7 @@ build:
   android_home: ""
   java_home: ""
   auto_allow_bash: true
+  # Agent 编译验收：仅 app:assembleDebug（不跑 testDebugUnitTest / lintDebug）
+  assemble_only: true
+  # 兼容旧键；L0 与全局 assemble_only 任一为 true 即只编译
+  l0_assemble_only: true

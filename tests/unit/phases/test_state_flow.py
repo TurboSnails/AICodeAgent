@@ -160,7 +160,7 @@ class TestSelfReviewFallback:
             task_id="s1", raw_requirement="add login", level="L0",
             site_hint="", source="test", chat_id="", base_branch="main",
         )
-        with patch("phases.self_review.list_changed_files", return_value=["a.kt"]):
+        with patch("phases.self_review.list_task_relevant_changed_files", return_value=["a.kt"]):
             with patch("phases.self_review.workspace_context", return_value=""):
                 with patch("phases.self_review.cfg_bool", return_value=True):
                     with patch("phases.self_review.cfg_int", return_value=7):
@@ -176,7 +176,7 @@ class TestSelfReviewFallback:
             task_id="s2", raw_requirement="add login", level="L0",
             site_hint="", source="test", chat_id="", base_branch="main",
         )
-        with patch("phases.self_review.list_changed_files", return_value=["a.kt"]):
+        with patch("phases.self_review.list_task_relevant_changed_files", return_value=["a.kt"]):
             with patch("phases.self_review.workspace_context", return_value=""):
                 with patch("phases.self_review.cfg_bool", return_value=True):
                     with patch("phases.self_review.cfg_int", return_value=7):
@@ -193,7 +193,7 @@ class TestSelfReviewFallback:
             task_id="s3", raw_requirement="add login", level="L0",
             site_hint="", source="test", chat_id="", base_branch="main",
         )
-        with patch("phases.self_review.list_changed_files", return_value=["a.kt"]):
+        with patch("phases.self_review.list_task_relevant_changed_files", return_value=["a.kt"]):
             with patch("phases.self_review.workspace_context", return_value=""):
                 with patch("phases.self_review.cfg_bool", return_value=True):
                     with patch("phases.self_review.cfg_int", return_value=7):

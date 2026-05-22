@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Optional
 
 from utils.logging_config import get_logger
+from utils.paths import DATA_DIR
 
-DB_FILE = Path(__file__).resolve().parents[1] / "data" / "agent.db"
+DB_FILE = DATA_DIR / "agent.db"
 logger = get_logger(__name__)
 
 
@@ -463,6 +464,12 @@ def cancel_task(task_id: str, reason: str = "user cancelled") -> bool:
         )
         conn.commit()
         logger.info(f"{task_id}: {current} -> cancelled | {reason}")
+        try:
+            from utils.task_cancel import interrupt_running_work
+
+            interrupt_running_work(task_id)
+        except Exception as e:
+            logger.warning("interrupt_running_work after cancel %s: %s", task_id, e)
         return True
     except sqlite3.OperationalError as e:
         logger.error(f"{e}")

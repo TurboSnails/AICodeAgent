@@ -15,6 +15,19 @@ def classifier():
     return RequestClassifier()
 
 
+class TestRulesFirstFastPath:
+    @patch("services.request_classifier.cfg_bool", side_effect=lambda k, d=False: k == "routing.rules_first" if k == "routing.rules_first" else (k == "routing.enabled" or d))
+    @patch("services.request_classifier.cfg_str", return_value="hybrid")
+    def test_vippager_skips_llm(self, _cfg_str, _cfg_bool):
+        ai = MagicMock()
+        clf = RequestClassifier(ai_client=ai)
+        req = "帮我看下 VIPPager 颜色渐变从第二个开始不对"
+        result = clf.classify(req, "L0")
+        assert result.request_type == "code"
+        assert result.source == "rule-fast"
+        ai.call.assert_not_called()
+
+
 class TestExplainClassification:
     def test_explain_how_does(self, classifier):
         result = classifier.classify("How does SiteRules work?")
@@ -31,6 +44,15 @@ class TestExplainClassification:
 
     def test_explain_chinese2(self, classifier):
         result = classifier.classify("解释一下这个设计模式")
+        assert result.request_type == "explain"
+
+    def test_explain_project_intro(self, classifier):
+        result = classifier.classify("请介绍下当前这个wm项目 功能是啥")
+        assert result.request_type == "explain"
+        assert result.confidence >= 0.95
+
+    def test_explain_introduce(self, classifier):
+        result = classifier.classify("介绍一下这个项目是做什么的")
         assert result.request_type == "explain"
 
 
@@ -126,3 +148,55 @@ class TestConfigFlags:
         with patch("services.request_classifier.cfg_bool", side_effect=fake_cfg):
             result = classifier.classify("Design a system")
             assert result.request_type == "code"
+
+
+class TestLlmRouting:
+    def test_llm_explain(self):
+        ai = MagicMock()
+        ai.call.return_value = (
+            '{"request_type":"explain","confidence":0.92,"reason":"项目介绍"}'
+        )
+        with patch("services.request_classifier.cfg_str", return_value="llm"):
+            c = RequestClassifier(ai_client=ai)
+            result = c.classify("随便一句模糊话")
+        assert result.request_type == "explain"
+        assert result.source == "llm"
+        ai.call.assert_called_once()
+
+    def test_llm_parse_codeblock(self):
+        ai = MagicMock()
+        ai.call.return_value = '```json\n{"request_type":"code","confidence":0.88,"reason":"实现"}\n```'
+        with patch("services.request_classifier.cfg_str", return_value="hybrid"):
+            c = RequestClassifier(ai_client=ai)
+            result = c.classify("给登录页加个按钮")
+        assert result.request_type == "code"
+        assert result.source == "llm"
+
+    def test_llm_fail_falls_back_to_rules(self):
+        ai = MagicMock()
+        ai.call.side_effect = RuntimeError("timeout")
+        with patch("services.request_classifier.cfg_str", return_value="hybrid"):
+            c = RequestClassifier(ai_client=ai)
+            result = c.classify("请介绍下当前这个wm项目 功能是啥")
+        assert result.request_type == "explain"
+        assert result.source == "rule"
+
+    def test_llm_invalid_json_falls_back(self):
+        ai = MagicMock()
+        ai.call.return_value = "I think this is explain type"
+        with patch("services.request_classifier.cfg_str", return_value="llm"):
+            c = RequestClassifier(ai_client=ai)
+            result = c.classify("How does SiteRules work?")
+        assert result.request_type == "explain"
+        assert result.source == "rule"
+
+
+class TestParseLlmResponse:
+    def test_bare_json(self):
+        parsed = RequestClassifier._parse_llm_response(
+            '{"request_type":"review_only","confidence":0.9,"reason":"PR"}'
+        )
+        assert parsed == ("review_only", 0.9, "PR")
+
+    def test_invalid_type(self):
+        assert RequestClassifier._parse_llm_response('{"request_type":"magic"}') is None
