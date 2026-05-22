@@ -1,14 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-# Headless Agent V3 停止脚本
+# Headless Agent V4 停止脚本
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PID_DIR="$PROJECT_ROOT/AICodeAgent/data/pids"
+# shellcheck source=install/lib/agent_paths.sh
+source "$SCRIPT_DIR/install/lib/agent_paths.sh"
 
 echo "========================================"
-echo "  Headless Agent V3 — Stopping..."
+echo "  Headless Agent V4 — Stopping..."
 echo "========================================"
 
 if [ ! -d "$PID_DIR" ]; then

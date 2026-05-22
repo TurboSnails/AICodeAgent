@@ -1,0 +1,79 @@
+version: "3.9"
+
+services:
+  executor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agent-executor
+    restart: unless-stopped
+    volumes:
+      - ./:/workspace/AICodeAgent:rw
+      - agent-data:/workspace/AICodeAgent/data
+      - agent-workspace:/workspace/AICodeAgent/workspace
+      # 将宿主机的 Android SDK / Java 挂载进来（需根据实际路径调整）
+      - ${ANDROID_HOME:?ANDROID_HOME not set}:/opt/android-sdk:ro
+      - ${JAVA_HOME:?JAVA_HOME not set}:/opt/java:ro
+    environment:
+      - ANDROID_HOME=/opt/android-sdk
+      - JAVA_HOME=/opt/java
+      - CLAUDE_CODE_AUTO_ALLOW_BASH=true
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-sonnet-4-6}
+      - AGENT_TASK_TOTAL_TIMEOUT=${AGENT_TASK_TOTAL_TIMEOUT:-7200}
+      - AGENT_LOG_LEVEL=${AGENT_LOG_LEVEL:-INFO}
+      - PYTHONUNBUFFERED=1
+    working_dir: /workspace/AICodeAgent
+    command: ["python3", "orchestrator/executor.py"]
+    networks:
+      - agent-net
+
+  web-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agent-web-ui
+    restart: unless-stopped
+    ports:
+      - "${AGENT_WEB_PORT:-6789}:6789"
+    volumes:
+      - ./:/workspace/AICodeAgent:rw
+      - agent-data:/workspace/AICodeAgent/data
+    environment:
+      - AGENT_API_KEY=${AGENT_API_KEY:-}
+      - AGENT_LOG_LEVEL=${AGENT_LOG_LEVEL:-INFO}
+      - PYTHONUNBUFFERED=1
+    working_dir: /workspace/AICodeAgent
+    command: ["python3", "gateway/web_ui_v2.py"]
+    depends_on:
+      - executor
+    networks:
+      - agent-net
+
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agent-telegram-bot
+    restart: unless-stopped
+    volumes:
+      - ./:/workspace/AICodeAgent:rw
+      - agent-data:/workspace/AICodeAgent/data
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - AGENT_LOG_LEVEL=${AGENT_LOG_LEVEL:-INFO}
+      - PYTHONUNBUFFERED=1
+    working_dir: /workspace/AICodeAgent
+    command: ["python3", "gateway/telegram_bot_v2.py"]
+    depends_on:
+      - executor
+    networks:
+      - agent-net
+
+volumes:
+  agent-data:
+  agent-workspace:
+
+networks:
+  agent-net:
+    driver: bridge

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>任务中心 — AICodeAgent</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body class="app">
+
+<header class="header">
+  <div class="header-inner">
+    <a class="logo" href="/static/index.html">
+      <span class="logo-icon">AI</span>
+      <span class="logo-name">CodeAgent</span>
+    </a>
+    <div class="header-right">
+      <span class="online-tag" id="healthPill"><span class="online-dot" id="healthDot"></span><span id="healthLabel">连接中</span></span>
+      <span class="muted-text" id="lastRefresh"></span>
+    </div>
+  </div>
+</header>
+
+<main class="main">
+
+  <section class="welcome">
+    <h1>任务中心</h1>
+    <p>写下你的开发需求，AI 会自动完成规划、编码、测试并提交代码。</p>
+    <div class="stats">
+      <div class="stat"><strong id="statTotal">0</strong><span>📁 全部</span></div>
+      <div class="stat stat-blue"><strong id="statActive">0</strong><span>🚀 进行中</span></div>
+      <div class="stat stat-amber"><strong id="statWaiting">0</strong><span>⏳ 需要你</span></div>
+      <div class="stat stat-green"><strong id="statDone">0</strong><span>✅ 已完成</span></div>
+    </div>
+  </section>
+
+  <nav class="main-tabs" id="mainTabs">
+    <button type="button" class="main-tab active" data-tab="compose">📝 新建任务</button>
+    <button type="button" class="main-tab" data-tab="actions">⏳ 有任务等你处理 <span class="tab-badge" id="actionBadge">0</span></button>
+    <button type="button" class="main-tab" data-tab="tasks">📋 我的任务</button>
+  </nav>
+
+  <div id="notifyCenter"></div>
+
+  <div id="tab-compose" class="tab-panel active">
+    <section class="card compose-card">
+      <h2 class="card-heading">📝 新建任务</h2>
+      <div class="form-group">
+        <label for="req">你想做什么？</label>
+        <textarea id="req" class="input" rows="4" placeholder="尽量写清楚：改什么页面、用什么技术、有没有参考样式…"></textarea>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="level">规模</label>
+          <select id="level" class="input">
+            <option value="auto">自动判断</option>
+            <option value="L0">小改动（文案、颜色等）</option>
+            <option value="L1">普通功能</option>
+            <option value="L2">大改动（需你确认后再做）</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="site">项目站点</label>
+          <input id="site" class="input" type="text" placeholder="选填，如 haobo">
+        </div>
+      </div>
+      <button type="button" class="btn btn-primary btn-lg" onclick="onSubmitClick()">提交任务</button>
+    </section>
+  </div>
+
+  <div id="tab-actions" class="tab-panel">
+    <section id="actionArea" class="alert-box" hidden>
+      <div class="alert-box-head">
+        <span class="alert-icon">!</span>
+        <div>
+          <h2>有任务等你处理</h2>
+          <p>核准大改动，或回复澄清问题后才会继续</p>
+        </div>
+        <span class="alert-count" id="actionCount">0</span>
+      </div>
+      <div id="actionList"></div>
+    </section>
+    <div id="actionEmpty" class="empty-state" hidden>
+      <p>暂时没有需要你处理的任务 👍</p>
+    </div>
+  </div>
+
+  <div id="tab-tasks" class="tab-panel">
+    <section class="card tasks-card">
+    <div class="tasks-head">
+      <h2 class="card-heading">📋 我的任务</h2>
+      <div class="tasks-tools">
+        <input id="filterSearch" class="input input-search" type="search" placeholder="搜索…" oninput="onSearchInput()">
+        <select id="filterState" class="input input-select" onchange="onFilterChange()">
+          <option value="">全部状态</option>
+          <option value="waiting_gate">待你确认</option>
+          <option value="waiting_clarification">待你回复</option>
+          <option value="coding">正在编码</option>
+          <option value="building">正在构建</option>
+          <option value="completed">已完成</option>
+          <option value="failed">失败</option>
+          <option value="cancelled">已取消</option>
+        </select>
+      </div>
+    </div>
+    <div class="tabs" id="quickFilters">
+      <button type="button" class="tab active" data-state="">全部</button>
+      <button type="button" class="tab" data-state="waiting_gate">待确认</button>
+      <button type="button" class="tab" data-state="waiting_clarification">待回复</button>
+      <button type="button" class="tab" data-state="coding">进行中</button>
+      <button type="button" class="tab" data-state="completed">已完成</button>
+    </div>
+    <div class="task-list" id="taskList">
+      <p class="empty">加载中…</p>
+    </div>
+  </section>
+  </div>
+
+</main>
+
+<div id="toast-container"></div>
+
+<div class="modal" id="submitModal">
+  <div class="modal-dialog">
+    <h3 id="submitModalTitle">确认提交</h3>
+    <p id="submitModalBody"></p>
+    <div class="modal-foot">
+      <button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button>
+      <button type="button" class="btn btn-primary" onclick="confirmSubmit()">确定提交</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="confirmModal">
+  <div class="modal-dialog">
+    <h3 id="confirmModalTitle">确认</h3>
+    <p id="confirmModalBody"></p>
+    <div class="modal-foot">
+      <button type="button" class="btn btn-secondary" onclick="closeConfirmModal()">取消</button>
+      <button type="button" class="btn btn-danger" id="confirmModalBtn">确定</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

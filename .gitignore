@@ -8,6 +8,11 @@ workspace/
 __pycache__/
 *.pyc
 .Python
+.venv/
+.env
+
+# 安装产物
+dist/
 
 # 日志
 *.log

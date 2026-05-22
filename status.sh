@@ -1,15 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-# Headless Agent V3 状态脚本
+# Headless Agent V4 状态脚本
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PID_DIR="$PROJECT_ROOT/AICodeAgent/data/pids"
-LOG_DIR="$PROJECT_ROOT/AICodeAgent/data/logs"
+# shellcheck source=install/lib/agent_paths.sh
+source "$SCRIPT_DIR/install/lib/agent_paths.sh"
 
 echo "========================================"
-echo "  Headless Agent V3 — Status"
+echo "  Headless Agent V4 — Status"
 echo "========================================"
 
 if [ -d "$PID_DIR" ]; then
@@ -28,7 +27,7 @@ else
 fi
 
 echo ""
-echo "  Workspace:  $PROJECT_ROOT/AICodeAgent/workspace/"
+echo "  Workspace:  $PROJECT_ROOT/workspace/"
 echo "  Logs:       $LOG_DIR/"
 echo "  Web UI:     http://localhost:6789"
 echo "========================================"

@@ -1,21 +1,40 @@
 #!/bin/bash
 set -euo pipefail
 
-# Headless Agent V3 启动脚本
+# Headless Agent V4 启动脚本
 # 启动所有服务：Web UI、Telegram Bot、Serial Executor
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATA_DIR="$PROJECT_ROOT/AICodeAgent/data"
-PID_DIR="$DATA_DIR/pids"
-LOG_DIR="$DATA_DIR/logs"
+# shellcheck source=install/lib/agent_paths.sh
+source "$SCRIPT_DIR/install/lib/agent_paths.sh"
 
 echo "========================================"
-echo "  Headless Agent V3 — Starting..."
+echo "  Headless Agent V4 — Starting..."
 echo "========================================"
 
 # --- 环境检查 ---
 : "${CLAUDE_CODE_AUTO_ALLOW_BASH:=true}"
+# 第三方网关若未支持 claude-opus-4-7，用 4.6；与 .claude/settings.json 一致
+: "${CLAUDE_MODEL:=claude-sonnet-4-6}"
+: "${ANTHROPIC_DEFAULT_OPUS_MODEL:=claude-opus-4-6}"
+: "${ANTHROPIC_DEFAULT_SONNET_MODEL:=claude-sonnet-4-6}"
+export CLAUDE_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+
+# orchestrator 的 claude --print：仅用当前 shell 的 ANTHROPIC_*（与 cc-use / IDE 切换无关）
+if [[ -n "${ANTHROPIC_BASE_URL:-}" ]]; then
+  echo "[CHECK] ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL CLAUDE_MODEL=${CLAUDE_MODEL:-default}"
+  if command -v curl &>/dev/null; then
+    code=$(curl -s -o /dev/null -w "%{http_code}" -m 5 \
+      "${ANTHROPIC_BASE_URL%/}/v1/models" \
+      -H "Authorization: Bearer ${ANTHROPIC_API_KEY:-}" 2>/dev/null || echo "000")
+    if [[ "$code" != "200" ]]; then
+      echo "[WARN] 端点 /v1/models 返回 HTTP $code，claude --print 可能失败" >&2
+    fi
+  fi
+else
+  echo "[CHECK] 未设 ANTHROPIC_BASE_URL，claude --print 将使用官方 Anthropic API"
+fi
+
 : "${ANDROID_HOME:?请设置 ANDROID_HOME 环境变量}"
 : "${JAVA_HOME:?请设置 JAVA_HOME 环境变量}"
 
@@ -28,8 +47,8 @@ _check_cmd() {
 }
 
 echo "[CHECK] 验证核心依赖..."
-_check_cmd python3
-python3 --version
+_check_cmd "$AGENT_PYTHON"
+"$AGENT_PYTHON" --version
 
 _check_cmd claude
 claude --version || { echo "[ERROR] claude CLI 不可用"; exit 1; }
@@ -40,20 +59,8 @@ gh --version || { echo "[ERROR] gh CLI 不可用"; exit 1; }
 _check_cmd java
 java -version 2>&1 | head -n 1
 
-if command -v node &> /dev/null; then
-    echo "[CHECK] node $(node -v)（Figma download:site 需要）"
-else
-    echo "[WARN] node 未安装，带 site_hint 的 Figma 资产拉取将失败"
-fi
-
-if [ -f "$PROJECT_ROOT/figma-tools/package.json" ]; then
-    echo "[CHECK] figma-tools 已就绪"
-else
-    echo "[WARN] figma-tools 目录不存在"
-fi
-
-if [ -n "${FIGMA_TOKEN:-}" ] || [ -f "$PROJECT_ROOT/figma-tools/.env" ]; then
-    echo "[CHECK] FIGMA_TOKEN 或 figma-tools/.env 已配置"
+if [ -n "${FIGMA_TOKEN:-}" ]; then
+    echo "[CHECK] FIGMA_TOKEN 已配置"
 else
     echo "[WARN] 未设置 FIGMA_TOKEN，UI 类任务可能缺少设计资产"
 fi
@@ -68,7 +75,7 @@ echo "[CHECK] 所有依赖检查通过"
 echo ""
 
 # --- 创建目录 ---
-mkdir -p "$DATA_DIR" "$PID_DIR" "$LOG_DIR" "$PROJECT_ROOT/AICodeAgent/workspace" "$PROJECT_ROOT/AICodeAgent/db"
+mkdir -p "$DATA_DIR" "$PID_DIR" "$LOG_DIR" "$PROJECT_ROOT/workspace" "$PROJECT_ROOT/data/db"
 
 # --- 停止旧进程 ---
 if [ -d "$PID_DIR" ]; then
@@ -87,14 +94,16 @@ fi
 # --- 启动 Web UI Gateway ---
 echo "[START] Web UI Gateway (port 6789)..."
 cd "$PROJECT_ROOT"
-nohup python3 "$PROJECT_ROOT/AICodeAgent/gateway/web_ui_v2.py" \
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$PROJECT_ROOT"
+nohup "$AGENT_PYTHON" "$PROJECT_ROOT/gateway/web_ui.py" \
     > "$LOG_DIR/web_ui.log" 2>&1 &
 echo $! > "$PID_DIR/web_ui.pid"
 sleep 1
 
 # --- 启动 Telegram Bot Gateway ---
 echo "[START] Telegram Bot Gateway..."
-nohup python3 "$PROJECT_ROOT/AICodeAgent/gateway/telegram_bot_v2.py" \
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$PROJECT_ROOT"
+nohup "$AGENT_PYTHON" "$PROJECT_ROOT/gateway/telegram_bot.py" \
     > "$LOG_DIR/telegram_bot.log" 2>&1 &
 echo $! > "$PID_DIR/telegram_bot.pid"
 sleep 1
@@ -108,9 +117,10 @@ if [ "${CRG_AUTO_START:-0}" = "1" ]; then
   sleep 2
 fi
 
-# --- 启动 Serial Executor ---
-echo "[START] Serial Executor..."
-nohup python3 "$PROJECT_ROOT/AICodeAgent/orchestrator/executor.py" \
+# --- 启动 V4 Serial Executor ---
+echo "[START] V4 Serial Executor (engine/runner)..."
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$PROJECT_ROOT"
+nohup "$AGENT_PYTHON" "$PROJECT_ROOT/engine/runner.py" \
     > "$LOG_DIR/executor.log" 2>&1 &
 echo $! > "$PID_DIR/executor.pid"
 sleep 1
@@ -123,7 +133,7 @@ echo "========================================"
 echo "  Web UI:     http://localhost:6789"
 echo "  Logs:       $LOG_DIR/"
 echo "  PIDs:       $PID_DIR/"
-echo "  Workspace:  $PROJECT_ROOT/AICodeAgent/workspace/"
+echo "  Workspace:  $PROJECT_ROOT/workspace/"
 echo "========================================"
 echo ""
 echo "Commands:"

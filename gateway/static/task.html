@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>任务详情 — AICodeAgent</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body class="app">
+
+<header class="header">
+  <div class="header-inner">
+    <a class="logo" href="/static/index.html">
+      <span class="logo-icon">AI</span>
+      <span class="logo-name">CodeAgent</span>
+    </a>
+    <a href="/static/index.html" class="btn btn-secondary btn-sm">← 返回列表</a>
+  </div>
+</header>
+
+<main class="main">
+
+  <div id="loading" class="card empty-state">加载中…</div>
+  <div id="error" class="card empty-state" style="display:none; color:var(--red);">找不到这个任务</div>
+
+  <div id="detail" style="display:none;">
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title" id="d-title">任务详情</div>
+          <div class="card-subtitle" id="d-meta"></div>
+        </div>
+        <div class="flex gap-sm items-center" id="d-actions"></div>
+      </div>
+      <div id="progressArea">
+        <p style="font-size:0.85rem;color:var(--text-2);margin-bottom:10px;font-weight:500;">进度</p>
+        <div class="progress-track" id="progressTrack"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">详细信息</div>
+      </div>
+      <div class="detail-grid" id="detailGrid"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">处理记录</div>
+      </div>
+      <div class="timeline" id="timeline"></div>
+    </div>
+  </div>
+
+</main>
+
+<div id="toast-container"></div>
+
+<div class="modal" id="confirmModal">
+  <div class="modal-dialog">
+    <h3 id="confirmModalTitle">确认</h3>
+    <p id="confirmModalBody"></p>
+    <div class="modal-foot">
+      <button type="button" class="btn btn-secondary" onclick="closeConfirmModal()">取消</button>
+      <button type="button" class="btn btn-danger" id="confirmModalBtn">确定</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/task.js"></script>
+</body>
+</html>
