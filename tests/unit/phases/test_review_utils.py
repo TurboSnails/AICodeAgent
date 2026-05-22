@@ -10,13 +10,17 @@ import pytest
 
 from phases._review_utils import (
     build_codex_review_prompt,
+    build_fix_plan_prompt,
     build_red_team_prompt,
     build_requirement_acceptance_prompt,
     list_changed_files,
+    merge_review_fix_plans,
+    parse_and_save_fix_plan,
     parse_codex_verdict,
     read_changed_sources,
     workspace_context,
 )
+from phases._fix_plan import FixItem, FixPlan, FixPriority
 
 
 class TestParseCodexVerdict:
@@ -133,3 +137,54 @@ class TestBuildPrompts:
         )
         assert "add login" in prompt
         assert "Red Team" in prompt
+
+
+class TestParseAndSaveFixPlan:
+    def test_parse_json_block_and_save(self, tmp_path: Path):
+        output = """
+Some review.
+```json
+{
+  "fix_plan": {
+    "items": [
+      {"priority": "HIGH", "category": "NPE", "description": "null risk", "target_files": ["A.kt"], "suggested_fix": "check"}
+    ]
+  }
+}
+```
+"""
+        plan = parse_and_save_fix_plan(output, tmp_path)
+        assert plan is not None
+        assert len(plan.items) == 1
+        assert plan.items[0].priority == FixPriority.HIGH
+        assert (tmp_path / "fix_plan.json").exists()
+
+    def test_no_json_returns_none(self, tmp_path: Path):
+        plan = parse_and_save_fix_plan("no fix plan here", tmp_path)
+        assert plan is None
+        assert not (tmp_path / "fix_plan.json").exists()
+
+    def test_prompt_contains_fix_plan_instruction(self):
+        prompt = build_fix_plan_prompt()
+        assert "Fix Plan" in prompt
+        assert "fix_plan" in prompt
+
+
+class TestMergeReviewFixPlans:
+    def test_merge_codex_and_red_team(self, tmp_path: Path):
+        import json as _json
+        (tmp_path / "codex_fix_plan.json").write_text(
+            _json.dumps({"items": [{"priority": "MEDIUM", "category": "A", "description": "a", "target_files": ["1.kt"], "suggested_fix": ""}]}),
+            encoding="utf-8",
+        )
+        (tmp_path / "red_team_fix_plan.json").write_text(
+            _json.dumps({"items": [{"priority": "CRITICAL", "category": "B", "description": "b", "target_files": ["2.kt"], "suggested_fix": ""}]}),
+            encoding="utf-8",
+        )
+        merged = merge_review_fix_plans(tmp_path)
+        assert merged is not None
+        assert len(merged.items) == 2
+        assert merged.items[0].priority == FixPriority.CRITICAL
+
+    def test_no_files_returns_none(self, tmp_path: Path):
+        assert merge_review_fix_plans(tmp_path) is None

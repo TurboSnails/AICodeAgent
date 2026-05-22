@@ -120,6 +120,69 @@ class TestStateTransition:
         assert history[0]["from_state"] == "pending"
         assert history[0]["to_state"] == "planning"
 
+class TestArchitectPlanningTransitions:
+    """架构规划阶段状态流转"""
+
+    def test_consensus_to_architect_planning(self, tmp_path: Path, monkeypatch):
+        db = tmp_path / "agent.db"
+        monkeypatch.setattr("engine.state_machine.DB_FILE", db, raising=False)
+        init_db()
+        save_task(Task(task_id="ap_tx1", raw_requirement="r", level="L1", site_hint="", source="test", chat_id=""))
+        transition("ap_tx1", State.PLANNING, "start")
+        transition("ap_tx1", State.DEBATING, "debate")
+        transition("ap_tx1", State.CONSENSUS, "consensus")
+        ok = transition("ap_tx1", State.ARCHITECT_PLANNING, "architect_planning")
+        assert ok is True
+        t = get_task("ap_tx1")
+        assert t.current_state == "architect_planning"
+
+    def test_architect_planning_to_coding(self, tmp_path: Path, monkeypatch):
+        db = tmp_path / "agent.db"
+        monkeypatch.setattr("engine.state_machine.DB_FILE", db, raising=False)
+        init_db()
+        save_task(Task(task_id="ap_tx2", raw_requirement="r", level="L1", site_hint="", source="test", chat_id=""))
+        transition("ap_tx2", State.PLANNING, "start")
+        transition("ap_tx2", State.DEBATING, "debate")
+        transition("ap_tx2", State.CONSENSUS, "consensus")
+        transition("ap_tx2", State.ARCHITECT_PLANNING, "architect_planning")
+        ok = transition("ap_tx2", State.CODING, "coding")
+        assert ok is True
+        t = get_task("ap_tx2")
+        assert t.current_state == "coding"
+
+    def test_architect_planning_to_waiting_clarification(self, tmp_path: Path, monkeypatch):
+        db = tmp_path / "agent.db"
+        monkeypatch.setattr("engine.state_machine.DB_FILE", db, raising=False)
+        init_db()
+        save_task(Task(task_id="ap_tx3", raw_requirement="r", level="L1", site_hint="", source="test", chat_id=""))
+        transition("ap_tx3", State.PLANNING, "start")
+        transition("ap_tx3", State.DEBATING, "debate")
+        transition("ap_tx3", State.CONSENSUS, "consensus")
+        transition("ap_tx3", State.ARCHITECT_PLANNING, "architect_planning")
+        ok = transition("ap_tx3", State.WAITING_CLARIFICATION, "clarify")
+        assert ok is True
+        t = get_task("ap_tx3")
+        assert t.current_state == "waiting_clarification"
+
+    def test_correcting_to_waiting_clarification(self, tmp_path: Path, monkeypatch):
+        db = tmp_path / "agent.db"
+        monkeypatch.setattr("engine.state_machine.DB_FILE", db, raising=False)
+        init_db()
+        save_task(Task(task_id="ap_tx4", raw_requirement="r", level="L1", site_hint="", source="test", chat_id=""))
+        transition("ap_tx4", State.PLANNING, "start")
+        transition("ap_tx4", State.DEBATING, "debate")
+        transition("ap_tx4", State.CONSENSUS, "consensus")
+        transition("ap_tx4", State.ARCHITECT_PLANNING, "architect_planning")
+        transition("ap_tx4", State.CODING, "coding")
+        transition("ap_tx4", State.SELF_REVIEW, "self_review")
+        transition("ap_tx4", State.CODEX_REVIEW, "codex_review")
+        transition("ap_tx4", State.CORRECTING, "correcting")
+        ok = transition("ap_tx4", State.WAITING_CLARIFICATION, "code_clarify")
+        assert ok is True
+        t = get_task("ap_tx4")
+        assert t.current_state == "waiting_clarification"
+
+
 class TestGateAndClarification:
     """L2 核准与需求澄清续跑"""
 

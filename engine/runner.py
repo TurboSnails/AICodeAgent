@@ -39,6 +39,7 @@ from engine.config_validator import validate_config
 from engine.core import AgentEngine
 from engine.exceptions import AgentFatalError
 from phases import (
+    ArchitectPlanningHandler,
     ArchitectReviewHandler,
     BuildingHandler,
     CodexReviewHandler,
@@ -120,6 +121,10 @@ def build_engine() -> AgentEngine:
         ai_client=ai_client,
     ))
     engine.register(State.CONSENSUS, ConsensusHandler(
+        ai_client=ai_client,
+        notification_service=notification_service,
+    ))
+    engine.register(State.ARCHITECT_PLANNING, ArchitectPlanningHandler(
         ai_client=ai_client,
         notification_service=notification_service,
     ))

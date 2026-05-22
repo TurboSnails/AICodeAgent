@@ -24,6 +24,7 @@ class State(Enum):
     WAITING_CLARIFICATION = "waiting_clarification"
     DEBATING = "debating"
     CONSENSUS = "consensus"
+    ARCHITECT_PLANNING = "architect_planning"
     WAITING_GATE = "waiting_gate"
     CODING = "coding"
     BUILDING = "building"
@@ -46,7 +47,8 @@ VALID_TRANSITIONS = {
     State.PLANNING: [State.DEBATING, State.CODING, State.WAITING_CLARIFICATION, State.CANCELLED],
     State.WAITING_CLARIFICATION: [State.PENDING, State.CANCELLED],
     State.DEBATING: [State.CONSENSUS, State.CORRECTING, State.CANCELLED],
-    State.CONSENSUS: [State.WAITING_GATE, State.CODING, State.CANCELLED],
+    State.CONSENSUS: [State.ARCHITECT_PLANNING, State.WAITING_GATE, State.CANCELLED],
+    State.ARCHITECT_PLANNING: [State.CODING, State.WAITING_CLARIFICATION, State.CANCELLED],
     State.WAITING_GATE: [State.CODING, State.CANCELLED, State.PENDING, State.WAITING_GATE],
     State.CODING: [State.BUILDING, State.CORRECTING, State.FAILED, State.CANCELLED],
     State.BUILDING: [State.SELF_REVIEW, State.CORRECTING, State.FAILED, State.CANCELLED],
@@ -55,7 +57,7 @@ VALID_TRANSITIONS = {
     State.ARCHITECT_REVIEW: [State.RED_TEAM_REVIEW, State.CORRECTING, State.FAILED, State.CANCELLED],
     State.RED_TEAM_REVIEW: [State.REQUIREMENT_REVIEW, State.CORRECTING, State.FAILED, State.CANCELLED],
     State.REQUIREMENT_REVIEW: [State.GIT_COMMITTING, State.CORRECTING, State.FAILED, State.CANCELLED],
-    State.CORRECTING: [State.CODING, State.FAILED, State.CANCELLED],
+    State.CORRECTING: [State.CODING, State.WAITING_CLARIFICATION, State.FAILED, State.CANCELLED],
     State.GIT_COMMITTING: [State.CREATING_PR, State.CANCELLED],
     State.CREATING_PR: [State.NOTIFYING, State.CANCELLED],
     State.NOTIFYING: [State.COMPLETED, State.FAILED, State.CANCELLED],
@@ -86,6 +88,10 @@ class Task:
     resume_after_clarification: int = 0
     # 各阶段重试计数器，如 {"codex": 1, "red_team": 0, "acceptance": 2}
     phase_counters: dict = field(default_factory=dict)
+    # 代码级澄清历史（architect_planning / correcting 阶段的不确定性）
+    code_clarification_history: list = field(default_factory=list)
+    # 澄清类型来源标记："planning" | "code"
+    clarification_type: str = ""
 
 
 
@@ -110,6 +116,10 @@ def _migrate_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE task_queue ADD COLUMN resume_after_clarification INTEGER DEFAULT 0")
     if "phase_counters" not in cols:
         conn.execute("ALTER TABLE task_queue ADD COLUMN phase_counters TEXT DEFAULT '{}'")
+    if "code_clarification_history" not in cols:
+        conn.execute("ALTER TABLE task_queue ADD COLUMN code_clarification_history TEXT DEFAULT '[]'")
+    if "clarification_type" not in cols:
+        conn.execute("ALTER TABLE task_queue ADD COLUMN clarification_type TEXT DEFAULT ''")
 
 
 def init_db():
@@ -136,7 +146,9 @@ def init_db():
             updated_at TEXT,
             gate_deadline TEXT,
             resume_from_gate INTEGER DEFAULT 0,
-            phase_counters TEXT DEFAULT '{}'
+            phase_counters TEXT DEFAULT '{}',
+            code_clarification_history TEXT DEFAULT '[]',
+            clarification_type TEXT DEFAULT ''
         )
     """)
     _migrate_schema(conn)
@@ -166,8 +178,9 @@ def save_task(task: Task) -> Task:
         (task_id, raw_requirement, level, site_hint, source, chat_id, status,
          current_state, attempt_count, max_retries, pr_url, branch, base_branch,
          error_log, created_at, updated_at, gate_deadline, resume_from_gate,
-         clarification_deadline, resume_after_clarification, phase_counters)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         clarification_deadline, resume_after_clarification, phase_counters,
+         code_clarification_history, clarification_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         task.task_id, task.raw_requirement, task.level, task.site_hint,
         task.source, task.chat_id, task.status, task.current_state,
@@ -177,6 +190,8 @@ def save_task(task: Task) -> Task:
         task.clarification_deadline or "",
         int(task.resume_after_clarification or 0),
         json.dumps(task.phase_counters or {}),
+        json.dumps(task.code_clarification_history or []),
+        task.clarification_type or "",
     ))
     conn.commit()
     conn.close()
@@ -471,6 +486,8 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         clarification_deadline=row["clarification_deadline"] if "clarification_deadline" in row.keys() else "",
         resume_after_clarification=row["resume_after_clarification"] if "resume_after_clarification" in row.keys() else 0,
         phase_counters=json.loads(row["phase_counters"]) if "phase_counters" in row.keys() and row["phase_counters"] else {},
+        code_clarification_history=json.loads(row["code_clarification_history"]) if "code_clarification_history" in row.keys() and row["code_clarification_history"] else [],
+        clarification_type=row["clarification_type"] if "clarification_type" in row.keys() else "",
     )
 
 

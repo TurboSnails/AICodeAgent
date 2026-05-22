@@ -47,27 +47,32 @@
 
   <div id="tab-compose" class="tab-panel active">
     <section class="card compose-card">
-      <h2 class="card-heading">📝 新建任务</h2>
       <div class="form-group">
         <label for="req">你想做什么？</label>
-        <textarea id="req" class="input" rows="4" placeholder="尽量写清楚：改什么页面、用什么技术、有没有参考样式…"></textarea>
+        <textarea id="req" class="input" rows="3" placeholder="尽量写清楚：改什么页面、用什么技术、有没有参考样式…&#10;按 Ctrl+Enter 快速提交"></textarea>
       </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label for="level">规模</label>
-          <select id="level" class="input">
-            <option value="auto">自动判断</option>
-            <option value="L0">小改动（文案、颜色等）</option>
-            <option value="L1">普通功能</option>
-            <option value="L2">大改动（需你确认后再做）</option>
-          </select>
+      <div class="inline-hint" id="levelHint"></div>
+      <div class="compose-toolbar">
+        <div class="compose-toolbar-left">
+          <div class="form-group">
+            <label for="level">规模</label>
+            <select id="level" class="input">
+              <option value="auto">自动判断</option>
+              <option value="L0">小改动（文案、颜色等）</option>
+              <option value="L1">普通功能</option>
+              <option value="L2">大改动（需你确认后再做）</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="site">项目站点</label>
+            <input id="site" class="input" type="text" placeholder="站点，如 haobo">
+          </div>
         </div>
-        <div class="form-group">
-          <label for="site">项目站点</label>
-          <input id="site" class="input" type="text" placeholder="选填，如 haobo">
-        </div>
+        <button type="button" class="btn btn-primary" id="submitBtn" onclick="onSubmitClick()" disabled>
+          <span class="btn-spinner"></span>
+          <span class="btn-text">提交任务</span>
+        </button>
       </div>
-      <button type="button" class="btn btn-primary btn-lg" onclick="onSubmitClick()">提交任务</button>
     </section>
   </div>
 
@@ -122,17 +127,6 @@
 </main>
 
 <div id="toast-container"></div>
-
-<div class="modal" id="submitModal">
-  <div class="modal-dialog">
-    <h3 id="submitModalTitle">确认提交</h3>
-    <p id="submitModalBody"></p>
-    <div class="modal-foot">
-      <button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button>
-      <button type="button" class="btn btn-primary" onclick="confirmSubmit()">确定提交</button>
-    </div>
-  </div>
-</div>
 
 <div class="modal" id="confirmModal">
   <div class="modal-dialog">

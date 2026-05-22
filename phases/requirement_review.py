@@ -18,6 +18,7 @@ from engine.state_machine import State, Task, save_task
 from phases._review_utils import (
     build_requirement_acceptance_prompt,
     list_changed_files,
+    parse_and_save_fix_plan,
     parse_codex_verdict,
     workspace_context,
 )
@@ -74,6 +75,9 @@ class RequirementReviewHandler(PhaseHandler):
         report = output or "（空输出）"
         (workspace / "requirement_review.md").write_text(report, encoding="utf-8")
 
+        # 尝试解析结构化 Fix Plan
+        fix_plan = parse_and_save_fix_plan(report, workspace)
+
         passed = parse_codex_verdict(report)
 
         if passed:
@@ -111,6 +115,7 @@ class RequirementReviewHandler(PhaseHandler):
             {
                 "requirement_report": report,
                 "fix_prompt": fix_prompt,
+                "fix_plan_path": str(workspace / "requirement_fix_plan.json") if fix_plan else None,
             },
         )
 

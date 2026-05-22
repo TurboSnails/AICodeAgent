@@ -2,15 +2,18 @@
 """
 审查阶段共享工具函数 — 从 orchestrator/codex_review.py 迁移
 提供 prompt 构建、verdict 解析、文件变更读取等纯逻辑函数。
+V4 优化：新增结构化 FixPlan 生成。
 """
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from phases._fix_plan import FixItem, FixPlan, FixPriority, parse_fix_plan_from_text
 from utils.paths import PROJECT_ROOT
 
 
@@ -114,6 +117,83 @@ def parse_codex_verdict(output: str) -> bool:
     if "FAIL" in text.upper() and "PASS" not in text.upper():
         return False
     return False
+
+
+def parse_and_save_fix_plan(output: str, workspace: Path) -> FixPlan:
+    """
+    从 Review 报告中解析 FixPlan，保存到 fix_plan.md。
+    尝试提取 JSON block 中的 FixPlan，失败时回退到文本解析。
+    """
+    # 先尝试从 JSON block 提取
+    json_blocks = re.findall(r"```(?:json)?\s*\n(.*?)\n```", output, re.DOTALL)
+    for block in json_blocks:
+        try:
+            data = json.loads(block.strip())
+            if isinstance(data, dict) and "items" in data:
+                plan = FixPlan.from_dict(data)
+                plan.write(workspace / "fix_plan.md")
+                return plan
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    # 回退到文本解析
+    plan = parse_fix_plan_from_text(output)
+    plan.write(workspace / "fix_plan.md")
+    return plan
+
+
+def build_fix_plan_prompt() -> str:
+    """附加在 Review prompt 末尾，要求 AI 输出结构化 FixPlan。"""
+    return """
+## 结构化修复计划（FAIL 时必填）
+
+请在报告末尾附加一个 JSON 格式的修复计划块：
+
+```json
+{
+  "items": [
+    {
+      "priority": "critical | high | medium | low",
+      "category": "build | logic | security | performance | regression | maintainability",
+      "description": "问题的具体描述",
+      "target_files": ["受影响文件路径"],
+      "suggested_fix": "建议的修复方法"
+    }
+  ],
+  "summary": "修复计划总结"
+}
+```
+
+优先级定义：
+- **critical**：编译/构建失败、崩溃、安全漏洞
+- **high**：逻辑错误、回归风险、NPE、竞态条件
+- **medium**：性能问题、可维护性
+- **low**：风格/nit
+"""
+
+
+def merge_review_fix_plans(workspace: Path) -> FixPlan | None:
+    """合并所有 Review 阶段产生的 fix_plan，返回合并后的 FixPlan。"""
+    plans = []
+    for name in ["codex_review.md", "red_team_audit.md", "requirement_review.md"]:
+        path = workspace / name
+        if path.exists():
+            text = path.read_text(encoding="utf-8")
+            plan = parse_fix_plan_from_text(text)
+            if plan.items:
+                plans.append(plan)
+
+    if not plans:
+        # 尝试读取已有的 fix_plan.md
+        fp = workspace / "fix_plan.md"
+        if fp.exists():
+            return FixPlan.read(fp)
+        return None
+
+    from phases._fix_plan import merge_fix_plans
+    merged = merge_fix_plans(*plans)
+    merged.write(workspace / "fix_plan.md")
+    return merged
 
 
 def build_codex_review_prompt(
@@ -294,4 +374,6 @@ PASS 或 FAIL
 
 **判定**：发现任一 Critical 或 High 级别安全问题、明显竞态/NPE 隐患、或多站点误伤 → **FAIL**。
 仅可接受的设计取舍或已充分防御的边界 → **PASS**。
+
+{build_fix_plan_prompt()}
 """

@@ -18,6 +18,7 @@ from engine.state_machine import State, Task, save_task
 from phases._review_utils import (
     build_red_team_prompt,
     list_changed_files,
+    parse_and_save_fix_plan,
     parse_codex_verdict,
     workspace_context,
 )
@@ -91,6 +92,9 @@ class RedTeamReviewHandler(PhaseHandler):
         report = output or "（空输出）"
         (workspace / "red_team_audit.md").write_text(report, encoding="utf-8")
 
+        # 尝试解析结构化 Fix Plan
+        fix_plan = parse_and_save_fix_plan(report, workspace)
+
         passed = parse_codex_verdict(report)
 
         if passed:
@@ -126,6 +130,7 @@ class RedTeamReviewHandler(PhaseHandler):
             {
                 "red_team_report": report,
                 "fix_prompt": fix_prompt,
+                "fix_plan_path": str(workspace / "red_team_fix_plan.json") if fix_plan else None,
             },
         )
 

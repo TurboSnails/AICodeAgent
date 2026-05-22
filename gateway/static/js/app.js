@@ -3,7 +3,6 @@
  */
 
 const $ = id => document.getElementById(id);
-let _pendingSubmit = null;
 let _prevTasks = [];
 const DONE = new Set(['completed', 'failed', 'cancelled']);
 const WAIT = new Set(['waiting_gate', 'waiting_clarification']);
@@ -178,28 +177,64 @@ function initMainTabs() {
   }
 }
 
+/* ---------- 输入框工具 ---------- */
+function autoResizeTextarea(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 300) + 'px';
+}
+
+function updateSubmitButton() {
+  const btn = $('submitBtn');
+  if (!btn) return;
+  const hasContent = $('req').value.trim().length > 0;
+  btn.disabled = !hasContent;
+}
+
+function updateLevelHint() {
+  const hint = $('levelHint');
+  if (!hint) return;
+  const level = $('level').value;
+  if (level === 'L2') {
+    hint.innerHTML = '⚠️ <b>大改动</b>：系统会先做好方案，等你确认后才会开始写代码。';
+    hint.classList.add('show');
+  } else if (level === 'auto') {
+    hint.innerHTML = '💡 <b>自动判断</b>：若判定为大改动，同样需要你确认后再继续。';
+    hint.classList.add('show');
+  } else {
+    hint.classList.remove('show');
+  }
+}
+
 /* ---------- 提交 ---------- */
 function onSubmitClick() {
   const requirement = $('req').value.trim();
   if (!requirement) { toast('请先填写需求', false); return; }
-  const level = $('level').value;
-  let body = '';
-  if (level === 'L2') body = '这是<b>大改动</b>，系统会先做好方案，<b>等你确认后</b>才会开始写代码。';
-  else if (level === 'auto') body = '系统会自动判断改动大小。若判定为大改动，同样需要你确认后再继续。';
-  else body = '提交后将按 <b>' + $('level').selectedOptions[0].text + '</b> 开始处理。';
-  $('submitModalBody').innerHTML = body;
-  $('submitModalTitle').textContent = '确认提交？';
-  _pendingSubmit = { requirement, level, site_hint: $('site').value.trim() };
-  $('submitModal').classList.add('show');
+
+  const btn = $('submitBtn');
+  if (btn.disabled || btn.classList.contains('btn-loading')) return;
+
+  btn.classList.add('btn-loading');
+  btn.disabled = true;
+
+  const payload = {
+    requirement,
+    level: $('level').value,
+    site_hint: $('site').value.trim(),
+  };
+
+  doSubmit(payload);
 }
-function closeModal() { $('submitModal').classList.remove('show'); _pendingSubmit = null; }
-async function confirmSubmit() {
-  if (!_pendingSubmit) return;
-  closeModal();
-  const res = await api('POST', '/api/task', _pendingSubmit);
+
+async function doSubmit(payload) {
+  const res = await api('POST', '/api/task', payload);
+  const btn = $('submitBtn');
+  btn.classList.remove('btn-loading');
+  updateSubmitButton();
+
   if (res.task_id) {
     toast('已提交，任务编号 ' + res.task_id);
     $('req').value = '';
+    autoResizeTextarea($('req'));
     loadTasks();
   } else {
     toast(res.error || '提交失败', false);
@@ -218,28 +253,38 @@ function showConfirm(title, body, btnText, btnClass, callback) {
 function closeConfirmModal() { $('confirmModal').classList.remove('show'); }
 
 async function continueTask(id) {
-  showConfirm('确认继续', '确定让任务 <b>' + id + '</b> 开始编码？', '确认', 'btn-success', async () => {
-    const res = await api('POST', '/api/continue/' + id);
-    toast(res.success ? '已开始执行' : '操作失败', res.success);
-    loadTasks();
-  });
+  const res = await api('POST', '/api/continue/' + id);
+  toast(res.success ? '已开始执行' : '操作失败', res.success);
+  loadTasks();
 }
+
 async function replyTask(id) {
   const el = document.getElementById('r-' + id);
-  if (!el || !el.value.trim()) { toast('请先输入回复内容', false); return; }
+  if (!el || !el.value.trim()) {
+    if (el) {
+      el.classList.add('input-error');
+      setTimeout(() => el.classList.remove('input-error'), 600);
+    }
+    toast('请先输入回复内容', false);
+    return;
+  }
   const val = el.value.trim();
-  showConfirm('发送回复', '确定发送这条澄清回复？', '发送', 'btn-primary', async () => {
-    const res = await api('POST', '/api/reply/' + id, { reply: val });
-    toast(res.success ? '已发送' : '发送失败', res.success);
-    loadTasks();
-  });
+  const res = await api('POST', '/api/reply/' + id, { reply: val });
+  toast(res.success ? '已发送' : '发送失败', res.success);
+  loadTasks();
 }
+
 async function cancelTask(id) {
-  showConfirm('取消任务', '确定取消任务 <b>' + id + '</b>？取消后无法恢复。', '取消任务', 'btn-danger', async () => {
-    const res = await api('POST', '/api/cancel/' + id);
-    toast(res.success ? '已取消' : '操作失败', res.success);
-    loadTasks();
-  });
+  const res = await api('POST', '/api/cancel/' + id);
+  toast(res.success ? '已取消' : '操作失败', res.success);
+  loadTasks();
+}
+
+function onReplyKeydown(e, id) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    replyTask(id);
+  }
 }
 
 /* ---------- 渲染 ---------- */
@@ -266,8 +311,8 @@ function renderActionCards(tasks) {
       <div class="action-card-body">${escapeHtml(t.raw_requirement)}</div>
       <div class="action-card-footer">
         ${isGate
-          ? `<button type="button" class="btn btn-success btn-sm" onclick="continueTask('${t.task_id}')">确认并继续</button>`
-          : `<input id="r-${t.task_id}" class="input" placeholder="输入你的回复…" style="flex:1;min-width:140px;" /><button type="button" class="btn btn-primary btn-sm" onclick="replyTask('${t.task_id}')">发送</button>`}
+          ? `<button type="button" class="btn btn-confirm-inline btn-sm" onclick="continueTask('${t.task_id}')">确认并继续</button>`
+          : `<input id="r-${t.task_id}" class="input" placeholder="输入你的回复，按 Enter 发送…" style="flex:1;min-width:140px;" onkeydown="onReplyKeydown(event, '${t.task_id}')" /><button type="button" class="btn btn-primary btn-sm" onclick="replyTask('${t.task_id}')">发送</button>`}
         <button type="button" class="btn btn-secondary btn-sm" onclick="cancelTask('${t.task_id}')">取消任务</button>
       </div>
     </div>`;
@@ -280,9 +325,9 @@ function renderTaskItem(t) {
   const faded = DONE.has(st);
   let actions = '';
   if (st === 'waiting_gate') {
-    actions = `<button type="button" class="btn btn-success btn-sm" onclick="continueTask('${t.task_id}')">确认</button>`;
+    actions = `<button type="button" class="btn btn-confirm-inline btn-sm" onclick="continueTask('${t.task_id}')">确认</button>`;
   } else if (st === 'waiting_clarification') {
-    actions = `<input id="r-${t.task_id}" class="input" placeholder="回复…" /><button type="button" class="btn btn-primary btn-sm" onclick="replyTask('${t.task_id}')">发送</button>`;
+    actions = `<input id="r-${t.task_id}" class="input" placeholder="回复…" onkeydown="onReplyKeydown(event, '${t.task_id}')" /><button type="button" class="btn btn-primary btn-sm" onclick="replyTask('${t.task_id}')">发送</button>`;
   }
   if (!DONE.has(st)) {
     actions += (actions ? ' ' : '') + `<button type="button" class="btn btn-secondary btn-sm" onclick="cancelTask('${t.task_id}')">取消</button>`;
@@ -370,9 +415,23 @@ async function loadTasks() {
   list.innerHTML = tasks.map(renderTaskItem).join('');
 }
 
+$('req').addEventListener('input', () => {
+  autoResizeTextarea($('req'));
+  updateSubmitButton();
+});
+$('req').addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    onSubmitClick();
+  }
+});
+$('level').addEventListener('change', updateLevelHint);
+
 initTabs();
 initMainTabs();
 checkHealth();
 loadTasks();
+updateSubmitButton();
+updateLevelHint();
 setInterval(loadTasks, 3000);
 setInterval(checkHealth, 30000);

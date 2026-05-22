@@ -24,6 +24,7 @@ phases 包 — V4 重构阶段处理器集合
 from __future__ import annotations
 
 from phases.base import PhaseHandler, PhaseResult
+from phases.architect_planning import ArchitectPlanningHandler
 from phases.architect_review import ArchitectReviewHandler
 from phases.building import BuildingHandler
 from phases.codex_review import CodexReviewHandler
@@ -47,6 +48,7 @@ __all__ = [
     "PlanningHandler",
     "DebateHandler",
     "ConsensusHandler",
+    "ArchitectPlanningHandler",
     "CodingHandler",
     "BuildingHandler",
     "SelfReviewHandler",

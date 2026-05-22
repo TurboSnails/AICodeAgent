@@ -85,8 +85,8 @@ class ConsensusHandler(PhaseHandler):
                 self._notify.notify_l2_gate(task)
             return PhaseResult(State.WAITING_GATE, "L2 gate waiting for /continue")
 
-        # 5. L0/L1 直接编码
-        return PhaseResult(State.CODING, "consensus passed")
+        # 5. L0/L1 进入架构规划阶段
+        return PhaseResult(State.ARCHITECT_PLANNING, "consensus passed")
 
     # ------------------------------------------------------------------
     # 共识生成

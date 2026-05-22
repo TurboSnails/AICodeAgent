@@ -111,6 +111,12 @@ escape:
 features:
   # 跳过需求澄清阶段（调试用）
   skip_clarification: false
+  # 启用 Architect Planning 架构规划阶段（默认开启）
+  architect_planning_enabled: true
+  # 架构规划适用的任务等级（逗号分隔）
+  architect_planning_for_levels: "L1,L2"
+  # 架构规划最大重试次数
+  architect_planning_max_retry: 2
   # 启用 Self Review 自审查（构建通过后自查，默认开启）
   self_review_enabled: true
   # Self Review 自信度阈值（0-10，低于此值进入 CORRECTING）
@@ -129,6 +135,12 @@ features:
   red_team_for_levels: "L2"
   # Red Team 最大重试次数
   red_team_max_retry: 1
+  # Correcting 阶段最大重试次数
+  correcting_max_retry: 3
+  # Correcting 转用户澄清阈值比例（0.0-1.0，达到 max_retry * ratio 时启动）
+  correcting_escalate_ratio: 0.6
+  # Correcting 连续停滞轮数（最高优先级问题未减少）触发转用户
+  correcting_stall_rounds: 2
 
 # =============================================================================
 # 构建环境（通常通过环境变量注入）

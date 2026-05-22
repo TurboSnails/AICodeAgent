@@ -129,6 +129,22 @@ class NotificationService:
         )
         self._broadcast(msg)
 
+    def notify_code_clarification(self, task, questions: list[str], context: str = "") -> None:
+        """代码层面待澄清时通知用户（planning 或 correcting 阶段触发）"""
+        qs = "\n".join(f"• {q}" for q in questions)
+        type_label = "代码修复待澄清" if getattr(task, "clarification_type", None) == "code" else "架构规划待澄清"
+        ctx = f"\n上下文: {context[:200]}\n" if context else ""
+        msg = (
+            f"<b>{type_label}</b>\n"
+            f"任务ID: <code>{task.task_id}</code>\n"
+            f"需求: {task.raw_requirement[:100]}\n"
+            f"{ctx}\n"
+            f"待澄清问题:\n{qs}\n\n"
+            f"请回复: <code>/reply {task.task_id} 你的回答</code>\n"
+            f"或 Web POST /api/reply"
+        )
+        self._broadcast(msg)
+
     def notify_bot_online(self) -> None:
         """Bot 启动上线通知"""
         self._broadcast("Android Headless Agent V4 Bot 已上线\n发送 /help 查看命令")

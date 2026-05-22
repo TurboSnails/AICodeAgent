@@ -207,6 +207,9 @@ class MockNotifyService:
     def notify_clarification(self, task, questions: list[str]) -> None:
         pass
 
+    def notify_code_clarification(self, task, questions: list[str], context: str = "") -> None:
+        pass
+
     def notify_l2_gate(self, task) -> None:
         pass
 
