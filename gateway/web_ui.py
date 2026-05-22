@@ -179,14 +179,16 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             site_hint = payload.get("site_hint", "")
             source = payload.get("source", "web")
             chat_id = payload.get("chat_id", "")
+            request_type = payload.get("request_type", "")
             task = self._task_service.submit_task(
                 requirement=requirement,
                 level=level,
                 site_hint=site_hint,
                 source=source,
                 chat_id=chat_id,
+                request_type=request_type,
             )
-            self._json({"task_id": task.task_id, "level": task.level, "status": task.status})
+            self._json({"task_id": task.task_id, "level": task.level, "status": task.status, "request_type": task.request_type})
             return
 
         # L2 核准
@@ -247,6 +249,7 @@ def _task_to_dict(task) -> dict:
         "updated_at": task.updated_at,
         "gate_deadline": task.gate_deadline,
         "clarification_deadline": task.clarification_deadline,
+        "request_type": getattr(task, "request_type", "code"),
     }
 
 

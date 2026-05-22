@@ -81,6 +81,13 @@ class ArchitectPlanningHandler(PhaseHandler):
             logger.warning("Found %d blocking uncertainties for %s", len(blocking), task.task_id)
             return self._enter_code_clarification(task, workspace, blocking)
 
+        # [新增] DESIGN_ONLY 请求：输出 design.md 后直接完成
+        if getattr(task, "request_type", "code") == "design_only":
+            logger.info("DESIGN_ONLY task %s — delivering design.md and completing", task.task_id)
+            if self._notify:
+                self._notify.notify_task_completed(task, artifact_path=workspace / "design.md")
+            return PhaseResult(State.COMPLETED, "design_only — design.md delivered")
+
         logger.info("Architect planning passed for %s, proceeding to coding", task.task_id)
         return PhaseResult(State.CODING, "architect_planning complete, no blocking uncertainties")
 

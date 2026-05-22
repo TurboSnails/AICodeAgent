@@ -33,6 +33,7 @@ from phases.correcting import CorrectingHandler
 from phases.creating_pr import CreatingPRHandler
 from phases.coding import CodingHandler
 from phases.debate import DebateHandler
+from phases.direct_answer import DirectAnswerHandler
 from phases.git_committing import GitCommittingHandler
 from phases.notifying import NotifyingHandler
 from phases.planning import PlanningHandler
@@ -49,6 +50,7 @@ __all__ = [
     "DebateHandler",
     "ConsensusHandler",
     "ArchitectPlanningHandler",
+    "DirectAnswerHandler",
     "CodingHandler",
     "BuildingHandler",
     "SelfReviewHandler",

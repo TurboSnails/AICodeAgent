@@ -48,6 +48,7 @@ from phases import (
     CreatingPRHandler,
     CodingHandler,
     DebateHandler,
+    DirectAnswerHandler,
     GitCommittingHandler,
     NotifyingHandler,
     PlanningHandler,
@@ -125,6 +126,10 @@ def build_engine() -> AgentEngine:
         notification_service=notification_service,
     ))
     engine.register(State.ARCHITECT_PLANNING, ArchitectPlanningHandler(
+        ai_client=ai_client,
+        notification_service=notification_service,
+    ))
+    engine.register(State.DIRECT_ANSWER, DirectAnswerHandler(
         ai_client=ai_client,
         notification_service=notification_service,
     ))

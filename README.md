@@ -17,6 +17,7 @@
 | **逻辑审查** | 全绿 → `codex_review`（逻辑/漏洞/回归）→ `red_team_review`（红队攻击视角，可配置仅 L2）→ `requirement_review`（对照原始需求 + 明显逻辑/性能），任一 FAIL 再修 |
 | **L2 闸门** | 辩论+共识后暂停 `waiting_gate`，`/continue` 或 Web 核准后再编码 |
 | **L0 快路径** | 跳过辩论，最小共识后直接编码 |
+| **智能路由** | Planning 阶段自动识别请求类型（`explain` / `design_only` / `review_only` / `code`），非编码请求走轻量路径，跳过编码/构建/PR 全流程 |
 | **视觉资产** | Code-First：`asset_analysis` → Figma 按需拉取 → `asset_map.json` |
 | **图谱上下文** | 可选 `graph_bridge` + CRG HTTP：语义检索 + 影响面（Codex/Architect 用） |
 
@@ -44,8 +45,15 @@ graph TD
     E -->|Planning + Intake| G{需求明确?}
     G -->|否| H[waiting_clarification]
     H -->|/reply| D
-    G -->|是| I[Multi-Agent Debate]
-    I --> J[Consensus → consensus.md]
+    G -->|是| I{请求类型}
+    I -->|explain| Z[DirectAnswer → answer.md]
+    I -->|design_only| Y[ArchitectPlanning → design.md]
+    I -->|review_only| X[Consensus → CodexReview]
+    I -->|code| I2[Multi-Agent Debate]
+    Z --> Q
+    Y --> Q
+    X --> Q
+    I2 --> J[Consensus → consensus.md]
     J -->|L2| K[waiting_gate → /continue]
     J -->|L0/L1| L[Claude 编码]
     K --> L
@@ -73,12 +81,20 @@ stateDiagram-v2
     [*] --> pending: 用户提交
     pending --> planning: Executor dequeue
     planning --> waiting_clarification: 需求不明确
-    planning --> debate: 需求明确
+    planning --> debate: 需求明确（code）
+    planning --> direct_answer: explain 类型
+    planning --> architect_planning: design_only 类型
+    planning --> consensus: review_only 类型
     waiting_clarification --> pending: /reply 用户澄清
     waiting_clarification --> cancelled: 超时 48h
+    direct_answer --> completed: 回答完成
+    direct_answer --> cancelled: 用户取消
+    architect_planning --> completed: 设计输出
+    architect_planning --> cancelled: 用户取消
     debate --> consensus: 三方汇总
     consensus --> waiting_gate: L2
     consensus --> coding: L0/L1
+    consensus --> codex_review: review_only 类型
     waiting_gate --> pending: /continue 续跑编码
     waiting_gate --> cancelled: 超时 24h
     coding --> building: Claude 写完
@@ -86,9 +102,9 @@ stateDiagram-v2
     building --> correcting: 编译失败
     self_review --> codex_review: 自查 PASS
     self_review --> correcting: 自查 FAIL
-    codex_review --> architect_review: 逻辑审查 PASS
+    codex_review --> architect_review: 逻辑审查 PASS（或关闭）
     codex_review --> correcting: 逻辑/回归 FAIL
-    architect_review --> red_team_review: 架构评审 PASS（或关闭）
+    architect_review --> red_team_review: 架构评审 PASS
     architect_review --> correcting: 架构评审 FAIL
     red_team_review --> requirement_review: 红队 PASS
     red_team_review --> correcting: 红队 FAIL
@@ -135,13 +151,15 @@ AICodeAgent/
 │
 ├── phases/
 │   ├── base.py                   # PhaseHandler 基类与 PhaseResult
-│   ├── planning.py               # 需求分析与规划
+│   ├── planning.py               # 需求分析与规划（含请求类型路由）
+│   ├── direct_answer.py          # explain 类型：直接回答输出 answer.md
 │   ├── debate.py                 # 多 Agent 辩论
-│   ├── consensus.py              # 共识汇总
+│   ├── consensus.py              # 共识汇总（review_only 可跳过到 codex_review）
 │   ├── coding.py                 # Claude 编码
 │   ├── building.py               # Gradle 构建
 │   ├── self_review.py            # 构建后自审查（V4 新增）
 │   ├── codex_review.py           # 构建后逻辑/回归审查
+│   ├── architect_planning.py     # 架构规划（design_only 类型输出后结束）
 │   ├── architect_review.py       # 架构/设计质量评审（V4 新增，可选）
 │   ├── red_team_review.py        # 红队攻击视角审查（L2 可选）
 │   ├── requirement_review.py     # 需求验收审查
@@ -153,6 +171,7 @@ AICodeAgent/
 │
 ├── services/
 │   ├── ai_client.py              # LLM 客户端封装
+│   ├── request_classifier.py     # 请求类型分类器（rule-based + 置信度）
 │   ├── task_service.py           # 任务生命周期管理
 │   ├── build_service.py          # 构建服务
 │   ├── git_service.py            # Git 操作封装
@@ -189,10 +208,12 @@ AICodeAgent/
 │       ├── test_asset_manager.py
 │       ├── test_config_loader.py
 │       ├── test_state_machine.py
+│       ├── test_request_classifier.py
 │       ├── test_codex_review.py
 │       ├── test_escape_detector.py
 │       ├── phases/
 │       │   ├── test_state_flow.py
+│       │   ├── test_direct_answer.py
 │       │   ├── test_coding.py
 │       │   ├── test_correcting.py
 │       │   ├── test_planning.py
@@ -319,6 +340,12 @@ gateway:
 | `features.red_team_enabled` | — | 是否启用红队审查（默认 true） |
 | `features.red_team_for_levels` | — | 红队适用的任务等级（默认 "L2"） |
 | `features.red_team_max_retry` | — | Red Team 最大重试次数 |
+| `routing.enabled` | — | 是否启用智能路由（默认 true） |
+| `routing.classifier` | — | 分类器类型，目前仅 "rule" |
+| `routing.confidence_threshold` | — | 分类置信度阈值（默认 0.7，低于则 fallback 为 code） |
+| `routing.enable_explain` | — | 允许 explain 类型路由（默认 true） |
+| `routing.enable_review_only` | — | 允许 review_only 类型路由（默认 true） |
+| `routing.enable_design_only` | — | 允许 design_only 类型路由（默认 true） |
 | `escape.unsolvable_repeat` | — | 连续相同错误视为不可解的阈值 |
 | `escape.file_threshold` | — | 文件数超阈值触发 L2 升级 |
 | `build.android_home` | `ANDROID_HOME` | Android SDK 路径 |
@@ -379,6 +406,12 @@ curl -X POST http://localhost:6789/api/trigger \
   -H "Authorization: Bearer $AGENT_API_KEY" \
   -d '{"raw_requirement":"在 strings.xml 增加 clear_cache","level":"L0"}'
 
+# 强制指定请求类型（可选：explain / design_only / review_only / code）
+curl -X POST http://localhost:6789/api/trigger \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $AGENT_API_KEY" \
+  -d '{"raw_requirement":"解释一下 RedTeamReview 的工作原理","request_type":"explain"}'
+
 # 需求澄清后
 curl -X POST http://localhost:6789/api/reply \
   -H "Content-Type: application/json" \
@@ -432,9 +465,29 @@ python3 -m pytest --cov=. tests/
 
 ---
 
+## 请求类型路由
+
+Planning 阶段内置 [`RequestClassifier`](services/request_classifier.py) 自动识别请求意图，支持以下 4 种类型：
+
+| 类型 | 识别特征 | 路由行为 | 输出产物 |
+|------|---------|---------|---------|
+| **explain** | "怎么工作"、"解释一下"、"what is"、"how does" 等 | Planning 后直接 [`DirectAnswer`](phases/direct_answer.py) → `completed` | `answer.md` |
+| **design_only** | "设计一个"、"设计方案"、"design a"、"architecture for" 等 | Planning → [`ArchitectPlanning`](phases/architect_planning.py) → `completed` | `design.md` |
+| **review_only** | "review"、"检查代码"、"帮我看看"、"code review" 等 | Planning → `consensus`（仅汇总上下文）→ `codex_review` → `completed` | `codex_review.md` |
+| **code**（默认） | "实现"、"添加"、"修复"、"fix"、"refactor" 等 | 走完整流水线：辩论 → 共识 → 编码 → 构建 → 审查 → PR | PR + commit |
+
+**机制说明**：
+1. **自动分类**：`planning.py` 在 Level 判定后调用 `RequestClassifier.classify()`，基于关键词规则匹配 + 置信度评分。
+2. **置信度阈值**：`routing.confidence_threshold`（默认 0.7），低于阈值时安全 fallback 为 `code` 类型。
+3. **手动指定**：Web / Telegram 提交时可显式传入 `request_type` 字段，跳过自动分类。
+4. **一键回退**：`routing.enabled: false` 时所有请求均按 `code` 类型处理，保持 V4 原有行为。
+5. **向下兼容**：Task 模型新增 `request_type` 字段（数据库默认 `'code'`），旧任务续跑不受影响。
+
+---
+
 ## 关键设计
 
-1. **V4 四层架构**：`engine`（编排调度）→ `phases`（状态处理器）→ `services`（业务服务）→ `utils`（通用工具）。所有阶段处理器继承 `phases/base.py` 的 `PhaseHandler` 基类，通过 `engine/core.py` 的显式注册表挂载到状态机。
+1. **V4 四层架构**：`engine`（编排调度）→ `phases`（状态处理器）→ `services`（业务服务）→ `utils`（通用工具）。所有阶段处理器继承 `phases/base.py` 的 `PhaseHandler` 基类，通过 `engine/core.py` 的显式注册表挂载到状态机。新增 `direct_answer` / `design_output` 状态时无需改动已有 handler。
 2. **先澄清再辩论**：Intake Agent 用 `claude --print` 输出 JSON；不明确则写 `clarification_questions.md` 并通知用户。
 3. **三阶段审查**：`codex_review`（逻辑/漏洞/回归）→ `red_team_review`（攻击视角：边界条件/竞态/NPE/安全/多站点/过度设计，可配置仅 L2）→ `requirement_review`（对照原始需求 + 明显逻辑/性能）；任一 FAIL 回到 `correcting`。
 4. **逃逸检测**：编码前评估 consensus 复杂度（文件数、跨模块、核心文件触碰），自动将 L0/L1 升级为 L2；编码循环中连续 2 次相同错误指纹视为不可解，终止并写 `escape_log.md`。
@@ -474,6 +527,7 @@ python3 -m pytest --cov=. tests/
 - [x] Docker 部署（`Dockerfile` + `docker-compose.yml`）
 - [x] 执行器崩溃恢复（stale 任务清理 + 状态回滚）
 - [x] Web 任务中心静态页
+- [x] 智能请求路由（explain / design_only / review_only / code）
 - [ ] Maestro 流程测试
 - [ ] Paparazzi + Figma 基线对比
 - [ ] 多站点并行 PR

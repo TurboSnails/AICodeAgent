@@ -4,9 +4,10 @@ Planning 阶段处理器 — V4 重构
 职责：
 1. 自动生成需求文档 (requirement.md)
 2. 准备资产上下文 (asset_analysis.json)
-3. 需求澄清判断：不明确则流转到 WAITING_CLARIFICATION
-4. L0 快速路径判断
-5. Auto level 判定
+3. 请求类型分类与路由（新增）
+4. 需求澄清判断：不明确则流转到 WAITING_CLARIFICATION
+5. L0 快速路径判断
+6. Auto level 判定
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from utils.config_loader import cfg_bool, cfg_int, cfg_str
 from utils.logging_config import get_logger
 from engine.state_machine import State, Task, save_task, transition
 from phases.base import PhaseHandler, PhaseResult
+from services.request_classifier import RequestClassifier
 
 logger = get_logger(__name__)
 from utils.paths import PROJECT_ROOT
@@ -34,13 +36,16 @@ FIGMA_KEYWORDS = [
 
 class PlanningHandler(PhaseHandler):
     """
-    Planning 阶段：需求 intake + 资产准备 + 澄清判断。
+    Planning 阶段：需求 intake + 资产准备 + 分类路由 + 澄清判断。
 
     输入状态：PLANNING
     输出状态：
       - WAITING_CLARIFICATION（需求不明确）
-      - DEBATING（L1/L2，正常路径）
-      - CODING（L0 快速路径）
+      - DEBATING（L1/L2 CODE_REQUEST 正常路径）
+      - CODING（L0 快速路径 / CODE_REQUEST）
+      - DIRECT_ANSWER（EXPLAIN_REQUEST）
+      - ARCHITECT_PLANNING（DESIGN_ONLY）
+      - CONSENSUS（REVIEW_ONLY）
     """
 
     def __init__(
@@ -61,27 +66,49 @@ class PlanningHandler(PhaseHandler):
             task.level = self._auto_level(task.raw_requirement)
             save_task(task)
 
-        # 2. 生成需求文档（除非已澄清续跑且文件已存在）
+        # 2. [新增] 请求类型分类
+        if not task.request_type or task.request_type == "code":
+            classifier = RequestClassifier()
+            result = classifier.classify_with_fallback(task.raw_requirement, task.level)
+            task.request_type = result.request_type
+            save_task(task)
+            logger.info(
+                "Task %s classified as %s (confidence=%.2f)",
+                task.task_id, task.request_type, result.confidence,
+            )
+
+        # 3. 生成需求文档（除非已澄清续跑且文件已存在）
         if not task.resume_after_clarification or not (workspace / "requirement.md").exists():
             self._generate_docs(task, workspace)
 
-        # 3. 准备资产上下文（除非已澄清续跑且文件已存在）
+        # 4. 准备资产上下文（除非已澄清续跑且文件已存在）
         if not task.resume_after_clarification or not (workspace / "asset_analysis.json").exists():
             self._prepare_asset_context(task, workspace)
 
-        # 4. 需求澄清判断（跳过条件：已澄清续跑 / 配置关闭 / L0 明确小改）
-        if not task.resume_after_clarification:
+        # 5. 需求澄清判断（跳过条件：已澄清续跑 / 配置关闭 / L0 明确小改 / 非编码请求）
+        if not task.resume_after_clarification and task.request_type == "code":
             needs_clarify, questions, reason = self._assess_clarity(task, workspace)
             if needs_clarify:
                 return self._enter_clarification(task, workspace, questions, reason)
 
-        # 5. L0 快速路径：跳过辩论
+        # 6. [新增] 根据 request_type 路由到不同路径
+        if task.request_type == "explain":
+            return PhaseResult(State.DIRECT_ANSWER, "explain request — skip coding pipeline")
+
+        if task.request_type == "design_only":
+            return PhaseResult(State.ARCHITECT_PLANNING, "design request — skip debate/consensus")
+
+        if task.request_type == "review_only":
+            self._bootstrap_review_consensus(task, workspace)
+            return PhaseResult(State.CODEX_REVIEW, "review_only — skip coding/building")
+
+        # 7. 原有 CODE_REQUEST 路径：L0 快速路径跳过辩论
         if task.level == "L0":
             logger.info("L0 fast path — skip debate/consensus")
             self._bootstrap_l0_consensus(task, workspace)
             return PhaseResult(State.CODING, "L0 fast path")
 
-        # 6. 正常路径 -> 辩论
+        # 8. 正常路径 -> 辩论
         return PhaseResult(State.DEBATING, "planning complete")
 
     # ------------------------------------------------------------------
@@ -192,6 +219,21 @@ class PlanningHandler(PhaseHandler):
 """
         (workspace / "consensus.md").write_text(consensus, encoding="utf-8")
         logger.info("Bootstrapped L0 consensus for %s", task.task_id)
+
+    def _bootstrap_review_consensus(self, task: Task, workspace: Path) -> None:
+        """REVIEW_ONLY 请求：生成最小化共识，直接标记为 Review 上下文"""
+        consensus = f"""# consensus.md — REVIEW_ONLY 模式
+
+## 任务概述
+- 需求: {task.raw_requirement}
+- 类型: REVIEW_ONLY（用户请求代码审查，无需编码）
+
+## Review 范围
+- 用户提供的代码 / PR / 文件路径
+- 由 CodexReview → ArchitectReview → RedTeamReview → RequirementReview 逐层审查
+"""
+        (workspace / "consensus.md").write_text(consensus, encoding="utf-8")
+        logger.info("Bootstrapped REVIEW_ONLY consensus for %s", task.task_id)
 
     # ------------------------------------------------------------------
     # 静态工具方法

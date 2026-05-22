@@ -26,6 +26,8 @@ class State(Enum):
     CONSENSUS = "consensus"
     ARCHITECT_PLANNING = "architect_planning"
     WAITING_GATE = "waiting_gate"
+    DIRECT_ANSWER = "direct_answer"
+    DESIGN_OUTPUT = "design_output"
     CODING = "coding"
     BUILDING = "building"
     SELF_REVIEW = "self_review"
@@ -44,12 +46,14 @@ class State(Enum):
 
 VALID_TRANSITIONS = {
     State.PENDING: [State.PLANNING, State.CANCELLED],
-    State.PLANNING: [State.DEBATING, State.CODING, State.WAITING_CLARIFICATION, State.CANCELLED],
+    State.PLANNING: [State.DEBATING, State.CODING, State.WAITING_CLARIFICATION, State.DIRECT_ANSWER, State.ARCHITECT_PLANNING, State.CONSENSUS, State.CANCELLED],
     State.WAITING_CLARIFICATION: [State.PENDING, State.CANCELLED],
     State.DEBATING: [State.CONSENSUS, State.CORRECTING, State.CANCELLED],
     State.CONSENSUS: [State.ARCHITECT_PLANNING, State.WAITING_GATE, State.CANCELLED],
-    State.ARCHITECT_PLANNING: [State.CODING, State.WAITING_CLARIFICATION, State.CANCELLED],
+    State.ARCHITECT_PLANNING: [State.CODING, State.DESIGN_OUTPUT, State.WAITING_CLARIFICATION, State.CANCELLED],
     State.WAITING_GATE: [State.CODING, State.CANCELLED, State.PENDING, State.WAITING_GATE],
+    State.DIRECT_ANSWER: [State.COMPLETED, State.FAILED, State.CANCELLED],
+    State.DESIGN_OUTPUT: [State.COMPLETED, State.FAILED, State.CANCELLED],
     State.CODING: [State.BUILDING, State.CORRECTING, State.FAILED, State.CANCELLED],
     State.BUILDING: [State.SELF_REVIEW, State.CORRECTING, State.FAILED, State.CANCELLED],
     State.SELF_REVIEW: [State.CODEX_REVIEW, State.CORRECTING, State.FAILED, State.CANCELLED],
@@ -92,6 +96,8 @@ class Task:
     code_clarification_history: list = field(default_factory=list)
     # 澄清类型来源标记："planning" | "code"
     clarification_type: str = ""
+    # 请求类型：code | explain | review_only | design_only
+    request_type: str = "code"
 
 
 
@@ -120,6 +126,8 @@ def _migrate_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE task_queue ADD COLUMN code_clarification_history TEXT DEFAULT '[]'")
     if "clarification_type" not in cols:
         conn.execute("ALTER TABLE task_queue ADD COLUMN clarification_type TEXT DEFAULT ''")
+    if "request_type" not in cols:
+        conn.execute("ALTER TABLE task_queue ADD COLUMN request_type TEXT DEFAULT 'code'")
 
 
 def init_db():
@@ -148,7 +156,8 @@ def init_db():
             resume_from_gate INTEGER DEFAULT 0,
             phase_counters TEXT DEFAULT '{}',
             code_clarification_history TEXT DEFAULT '[]',
-            clarification_type TEXT DEFAULT ''
+            clarification_type TEXT DEFAULT '',
+            request_type TEXT DEFAULT 'code'
         )
     """)
     _migrate_schema(conn)
@@ -179,8 +188,8 @@ def save_task(task: Task) -> Task:
          current_state, attempt_count, max_retries, pr_url, branch, base_branch,
          error_log, created_at, updated_at, gate_deadline, resume_from_gate,
          clarification_deadline, resume_after_clarification, phase_counters,
-         code_clarification_history, clarification_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         code_clarification_history, clarification_type, request_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         task.task_id, task.raw_requirement, task.level, task.site_hint,
         task.source, task.chat_id, task.status, task.current_state,
@@ -192,6 +201,7 @@ def save_task(task: Task) -> Task:
         json.dumps(task.phase_counters or {}),
         json.dumps(task.code_clarification_history or []),
         task.clarification_type or "",
+        task.request_type or "code",
     ))
     conn.commit()
     conn.close()
@@ -488,6 +498,7 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         phase_counters=json.loads(row["phase_counters"]) if "phase_counters" in row.keys() and row["phase_counters"] else {},
         code_clarification_history=json.loads(row["code_clarification_history"]) if "code_clarification_history" in row.keys() and row["code_clarification_history"] else [],
         clarification_type=row["clarification_type"] if "clarification_type" in row.keys() else "",
+        request_type=row["request_type"] if "request_type" in row.keys() else "code",
     )
 
 

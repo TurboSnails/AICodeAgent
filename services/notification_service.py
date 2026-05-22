@@ -91,8 +91,13 @@ class NotificationService:
     ) -> None:
         """任务状态变更时发送通知"""
         status_emoji = "✅" if task.current_state == State.COMPLETED.value else "❌"
+        type_label = getattr(task, "request_type", "code")
+        if type_label != "code":
+            type_label = f" [{type_label}]"
+        else:
+            type_label = ""
         msg = (
-            f"<b>{status_emoji} Android Agent</b>\n"
+            f"<b>{status_emoji} Android Agent{type_label}</b>\n"
             f"任务ID: <code>{task.task_id}</code>\n"
             f"状态: {task.current_state}\n"
             f"需求: {task.raw_requirement[:80]}\n"
@@ -103,6 +108,24 @@ class NotificationService:
             msg += f"错误: <pre>{task.error_log[:400]}</pre>\n"
         if extra_message:
             msg += f"\n{extra_message}\n"
+        self._broadcast(msg)
+
+    def notify_task_completed(self, task, artifact_path=None) -> None:
+        """非编码任务完成时通知用户（附带产物路径）"""
+        type_label = getattr(task, "request_type", "code")
+        type_names = {
+            "explain": "📖 问答完成",
+            "design_only": "🏗️ 设计完成",
+            "review_only": "🔍 审查完成",
+        }
+        title = type_names.get(type_label, "✅ 任务完成")
+        msg = (
+            f"<b>{title}</b>\n"
+            f"任务ID: <code>{task.task_id}</code>\n"
+            f"需求: {task.raw_requirement[:100]}\n"
+        )
+        if artifact_path:
+            msg += f"产物: <code>{artifact_path}</code>\n"
         self._broadcast(msg)
 
     def notify_clarification(self, task, questions: list[str]) -> None:

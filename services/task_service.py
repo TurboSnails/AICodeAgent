@@ -58,8 +58,9 @@ class TaskService:
         site_hint: str = "",
         source: str = "web",
         chat_id: str = "",
+        request_type: str = "",
     ) -> Task:
-        """提交新任务，自动判定等级（auto → L0/L1/L2）"""
+        """提交新任务，自动判定等级（auto → L0/L1/L2）和请求类型"""
         task_id = str(uuid.uuid4())[:8]
         if level == "auto":
             level = self._auto_level(requirement)
@@ -71,9 +72,10 @@ class TaskService:
             site_hint=site_hint,
             source=source,
             chat_id=chat_id,
+            request_type=request_type or "code",
         )
         save_task(task)
-        logger.info("Submitted task %s [%s]: %s", task_id, level, requirement[:80])
+        logger.info("Submitted task %s [%s|%s]: %s", task_id, level, task.request_type, requirement[:80])
         return task
 
     # ------------------------------------------------------------------

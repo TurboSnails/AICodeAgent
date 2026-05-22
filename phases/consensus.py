@@ -85,7 +85,12 @@ class ConsensusHandler(PhaseHandler):
                 self._notify.notify_l2_gate(task)
             return PhaseResult(State.WAITING_GATE, "L2 gate waiting for /continue")
 
-        # 5. L0/L1 进入架构规划阶段
+        # 5. [新增] REVIEW_ONLY 请求直接进入 CodexReview
+        if getattr(task, "request_type", "code") == "review_only":
+            logger.info("REVIEW_ONLY task %s — skip architect_planning, go to codex_review", task.task_id)
+            return PhaseResult(State.CODEX_REVIEW, "review_only — consensus passed, skip to review")
+
+        # 6. L0/L1 进入架构规划阶段
         return PhaseResult(State.ARCHITECT_PLANNING, "consensus passed")
 
     # ------------------------------------------------------------------
