@@ -438,9 +438,11 @@ class CodingHandler(PhaseHandler):
         consensus = workspace / "consensus.md"
         if consensus.exists():
             parts.append(f"\n## Consensus\n{consensus.read_text(encoding='utf-8')}")
-        fix_prompt = workspace / "fix_prompt.md"
-        if fix_prompt.exists():
-            parts.append(f"\n## Fix Instructions\n{fix_prompt.read_text(encoding='utf-8')}")
+        for _fix_name in ("single_fix_prompt.md", "fix_prompt.md"):
+            _fix_p = workspace / _fix_name
+            if _fix_p.exists():
+                parts.append(f"\n## Fix Instructions\n{_fix_p.read_text(encoding='utf-8')}")
+                break
         prepend_memory_to_parts(parts, load_memory_recall_from_workspace(workspace))
         context_path = workspace / "coding_context.md"
         context_path.write_text("\n".join(parts), encoding="utf-8")
@@ -486,9 +488,11 @@ class CodingHandler(PhaseHandler):
         if asset_map.exists():
             parts.append(f"\n## Asset Map\n```json\n{asset_map.read_text(encoding='utf-8')}\n```")
 
-        fix_prompt = workspace / "fix_prompt.md"
-        if fix_prompt.exists():
-            parts.append(f"\n## Fix Instructions\n{fix_prompt.read_text(encoding='utf-8')}")
+        for _fix_name in ("single_fix_prompt.md", "fix_prompt.md"):
+            _fix_p = workspace / _fix_name
+            if _fix_p.exists():
+                parts.append(f"\n## Fix Instructions\n{_fix_p.read_text(encoding='utf-8')}")
+                break
 
         prepend_memory_to_parts(parts, load_memory_recall_from_workspace(workspace))
 

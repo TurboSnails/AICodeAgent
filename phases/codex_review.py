@@ -95,6 +95,7 @@ class CodexReviewHandler(PhaseHandler):
         logger.warning("Codex review FAIL (round %d/%d)", codex_round, self._max_retries)
         task.error_log = report[:4000]
         task.phase_counters["codex"] = codex_round
+        task.phase_counters["last_fail_stage"] = "codex_review"
         save_task(task)
 
         if codex_round > self._max_retries:

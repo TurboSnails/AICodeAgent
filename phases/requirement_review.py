@@ -97,6 +97,7 @@ class RequirementReviewHandler(PhaseHandler):
         )
         task.error_log = report[:4000]
         task.phase_counters["acceptance"] = acceptance_round
+        task.phase_counters["last_fail_stage"] = "requirement_review"
         save_task(task)
 
         if acceptance_round > self._max_retries:

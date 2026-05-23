@@ -42,19 +42,36 @@ class CorrectingHandler(PhaseHandler):
 
     def handle(self, task: Task, workspace: Path, **kwargs) -> PhaseResult:
         task.attempt_count += 1
+
+        # 按来源阶段独立计数，避免不同类型修复共享全局上限
+        fail_source = task.phase_counters.get("last_fail_stage", "build")
+        source_key = f"correcting_{fail_source}"
+        source_count = task.phase_counters.get(source_key, 0) + 1
+        task.phase_counters[source_key] = source_count
         save_task(task)
 
         max_retries = cfg_int("retries.coding", 3) if task.max_retries is None else task.max_retries
+        per_source_max = cfg_int(f"retries.correcting_{fail_source}", max_retries)
 
-        # 1. 超出最大重试次数
-        if task.attempt_count > max_retries:
+        # 1. 超出全局重试次数（安全网：所有来源合计）
+        if task.attempt_count > max_retries * 2:
             logger.error(
-                "Max retries exceeded for %s (%d/%d)",
+                "Global max retries exceeded for %s (%d)",
                 task.task_id,
                 task.attempt_count,
-                max_retries,
             )
-            raise AgentFatalError(f"max retries exceeded ({max_retries})")
+            raise AgentFatalError(f"global max retries exceeded ({task.attempt_count})")
+
+        # 2. 超出该来源阶段的单独重试次数
+        if source_count > per_source_max:
+            logger.error(
+                "Per-source max retries exceeded for %s: source=%s count=%d/%d",
+                task.task_id,
+                fail_source,
+                source_count,
+                per_source_max,
+            )
+            raise AgentFatalError(f"{fail_source} correcting max retries exceeded ({source_count}/{per_source_max})")
 
         # 2. 不可解检测（复用 escape_detector）
         error_history = self._collect_error_history(workspace)
@@ -136,15 +153,19 @@ class CorrectingHandler(PhaseHandler):
 
     @staticmethod
     def _load_fix_plan(workspace: Path) -> FixPlan | None:
-        """加载结构化修复计划。"""
-        path = workspace / "fix_plan.md"
-        if not path.exists():
-            return None
-        try:
-            return FixPlan.read(path)
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning("Failed to parse fix_plan.md: %s", e)
-            return None
+        """加载结构化修复计划。优先读 fix_plan.json（review 阶段写入），回退 fix_plan.md。"""
+        for name in ("fix_plan.json", "fix_plan.md"):
+            path = workspace / name
+            if not path.exists():
+                continue
+            try:
+                plan = FixPlan.read(path)
+                if plan.items:
+                    logger.debug("Loaded fix plan from %s (%d items)", name, len(plan.items))
+                    return plan
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning("Failed to parse %s: %s", name, e)
+        return None
 
     def _should_escalate_to_user(
         self,

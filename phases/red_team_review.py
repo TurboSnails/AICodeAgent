@@ -112,6 +112,7 @@ class RedTeamReviewHandler(PhaseHandler):
         )
         task.error_log = report[:4000]
         task.phase_counters["red_team"] = red_team_round
+        task.phase_counters["last_fail_stage"] = "red_team_review"
         save_task(task)
 
         if red_team_round > max_retries:

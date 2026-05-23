@@ -75,6 +75,26 @@ class BuildingHandler(PhaseHandler):
                     "L0 compile-only build passed, skip review pipeline",
                     {"build_log": log},
                 )
+
+            # 断点续传：若上一次失败在某个 review 阶段，直接从那里重跑，跳过更早的阶段
+            _RESUME_STATES = {
+                "codex_review": State.CODEX_REVIEW,
+                "architect_review": State.ARCHITECT_REVIEW,
+                "red_team_review": State.RED_TEAM_REVIEW,
+                "requirement_review": State.REQUIREMENT_REVIEW,
+            }
+            last_fail = task.phase_counters.get("last_fail_stage", "")
+            if last_fail in _RESUME_STATES:
+                resume_state = _RESUME_STATES[last_fail]
+                logger.info("Build passed, resuming from %s (skipping earlier review stages)", last_fail)
+                task.phase_counters.pop("last_fail_stage", None)
+                save_task(task)
+                return PhaseResult(
+                    resume_state,
+                    f"build passed, resume from {last_fail}",
+                    {"build_log": log},
+                )
+
             return PhaseResult(
                 State.SELF_REVIEW,
                 "build passed",

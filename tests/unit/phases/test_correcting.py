@@ -24,12 +24,26 @@ class TestCorrectingAttemptCount:
             handler.handle(task, tmp_path)
         assert task.attempt_count == 1
 
-    def test_max_retries_exceeded_raises_fatal(self, tmp_path: Path):
+    def test_per_source_max_retries_exceeded_raises_fatal(self, tmp_path: Path):
+        """每个来源阶段独立计数：correcting_build 超出上限时应抛出 AgentFatalError"""
         handler = CorrectingHandler()
         task = Task(
             task_id="t2", raw_requirement="r", level="L0",
             site_hint="", source="test", chat_id="",
-            attempt_count=4, max_retries=3,
+            attempt_count=2, max_retries=3,
+            phase_counters={"correcting_build": 3},  # 再+1 = 4 > 3
+        )
+        with patch("phases.correcting.save_task"):
+            with pytest.raises(AgentFatalError, match="max retries exceeded"):
+                handler.handle(task, tmp_path)
+
+    def test_global_safety_net_raises_fatal(self, tmp_path: Path):
+        """全局安全网：总次数超 max_retries*2 时应抛出 AgentFatalError"""
+        handler = CorrectingHandler()
+        task = Task(
+            task_id="t2b", raw_requirement="r", level="L0",
+            site_hint="", source="test", chat_id="",
+            attempt_count=6, max_retries=3,  # 6+1=7 > 3*2=6
         )
         with patch("phases.correcting.save_task"):
             with pytest.raises(AgentFatalError, match="max retries exceeded"):
