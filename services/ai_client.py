@@ -402,7 +402,7 @@ class AIClient:
         stdout = (proc.stdout.read() if proc.stdout else "") or ""
         stderr_done.wait(timeout=5)
         return self._finalize_claude_result(
-            stdout, "", proc.returncode or -1, prompt_len,
+            stdout, "", proc.returncode if proc.returncode is not None else -1, prompt_len,
             progress_workspace=workspace, elapsed_sec=int(time.time() - start),
             attempt=attempt, max_attempts=max_attempts,
         )

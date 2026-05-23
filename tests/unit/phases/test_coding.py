@@ -157,3 +157,38 @@ class Test {}
         handler.handle(task, tmp_path)
 
         git.create_agent_branch.assert_not_called()
+    def test_tool_applied_files_are_staged_immediately(self, tmp_path: Path):
+        """Claude Edit 工具改的文件应在 fallback 检测后立即 git add，
+        防止 commit_from_consensus 的 git checkout -- . 回滚它们。"""
+        tool_files = ["app/src/main/java/Foo.kt", "app/src/main/res/values/strings.xml"]
+
+        git = MagicMock()
+        git.apply_code_changes.return_value = ([], [])
+        git.list_worktree_changed_paths.return_value = tool_files
+        git.partition_changed_paths.return_value = (tool_files, [])
+        git._run_cmd.return_value = (0, "", "")
+
+        ai = MagicMock()
+        ai.call.return_value = "The fix is clean. Here is what changed."
+
+        handler = CodingHandler(ai_client=ai, git_service=git)
+        task = Task(
+            task_id="toolapply1", raw_requirement="fix gradient", level="L0",
+            site_hint="", source="test", chat_id="",
+            branch="feature/agent-toolapply1",
+        )
+
+        result = handler.handle(task, tmp_path)
+
+        assert result.next_state == State.BUILDING
+        assert set(result.artifacts["applied_files"]) == set(tool_files)
+
+        staged_paths = [
+            call.args[0]
+            for call in git._run_cmd.call_args_list
+            if call.args and call.args[0][:3] == ["git", "add", "--"]
+        ]
+        for f in tool_files:
+            assert any(f in args for args in staged_paths), (
+                f"{f} was not staged via git add"
+            )

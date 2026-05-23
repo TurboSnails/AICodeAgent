@@ -266,6 +266,7 @@ class CodingHandler(PhaseHandler):
 
         write_phase_status(workspace, "coding", "正在解析并写入文件…")
         applied, blocked = self._git.apply_code_changes(claude_output)
+        apply_mode = "file_blocks" if applied else "none"
 
         if not applied and marker_count == 0:
             tool_applied, tool_blocked = self._git.partition_changed_paths(
@@ -273,15 +274,23 @@ class CodingHandler(PhaseHandler):
             )
             if tool_applied:
                 logger.info(
-                    "Coding %s: CLI Agent 已改 %d 个文件（无 FILE 块）: %s",
+                    "Coding %s: CLI Edit 已改 %d 个文件: %s",
                     task.task_id, len(tool_applied), tool_applied,
                 )
+                # Stage immediately so commit_from_consensus'''s `git checkout -- .`
+                # does not revert these unstaged Edit-tool changes.
+                for rel in tool_applied:
+                    self._git._run_cmd(["git", "add", "--", rel])
                 applied = tool_applied
                 blocked = tool_blocked
+                apply_mode = "cli_edit"
 
-        logger.info("Applied %d files, blocked %d for %s", len(applied), len(blocked), task.task_id)
+        logger.info(
+            "Applied %d files (%s), blocked %d for %s",
+            len(applied), apply_mode, len(blocked), task.task_id,
+        )
 
-        diag_hint = self._save_apply_diag(workspace, claude_output, applied, blocked, marker_count)
+        diag_hint = self._save_apply_diag(workspace, claude_output, applied, blocked, marker_count, apply_mode=apply_mode)
         if blocked:
             (workspace / "blocked_files.json").write_text(
                 json.dumps([{"path": p, "reason": r} for p, r in blocked], ensure_ascii=False),
@@ -307,10 +316,11 @@ class CodingHandler(PhaseHandler):
         blocked: list,
         marker_count: int,
         hint: str = "",
+        apply_mode: str = "",
     ) -> str:
         repo = str(self._git.project_root) if self._git else str(PROJECT_ROOT)
         if not hint:
-            if marker_count == 0:
+            if marker_count == 0 and apply_mode != "cli_edit":
                 hint = (
                     "Claude 输出未包含 === FILE: path === 块；"
                     "请确保模型输出完整文件而非纯分析文字"
@@ -322,6 +332,7 @@ class CodingHandler(PhaseHandler):
         diag = {
             "stdout_len": len(output),
             "file_markers_found": marker_count,
+            "apply_mode": apply_mode or ("file_blocks" if marker_count > 0 else "none"),
             "applied_count": len(applied),
             "applied_files": applied,
             "blocked_count": len(blocked),

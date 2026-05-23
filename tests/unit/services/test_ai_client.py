@@ -50,3 +50,19 @@ class TestParseClaudeStdout:
         assert "acceptEdits" in cmd
         assert "--allowed-tools" in cmd
         assert "Edit" in " ".join(cmd)
+
+
+class TestFinalizeReturnCode:
+    def test_zero_returncode_not_converted_to_minus_one(self):
+        """proc.returncode=0 应保持 0，不能被 `or -1` 转成 -1。"""
+        client = AIClient()
+        good_json = json.dumps({
+            "type": "result",
+            "is_error": False,
+            "result": "ok",
+        })
+        out = client._finalize_claude_result(
+            good_json, "", 0, 100,
+            progress_workspace=None, elapsed_sec=1,
+        )
+        assert out == "ok"
