@@ -58,6 +58,7 @@ class DirectAnswerHandler(PhaseHandler):
 
             # 保存回答
             answer_path = workspace / "answer.md"
+            answer_path.parent.mkdir(parents=True, exist_ok=True)
             answer_path.write_text(answer, encoding="utf-8")
             logger.info("Saved answer.md for %s (%d chars)", task.task_id, len(answer))
 

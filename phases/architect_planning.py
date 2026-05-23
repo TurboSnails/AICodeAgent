@@ -43,15 +43,24 @@ class ArchitectPlanningHandler(PhaseHandler):
         self._notify = notification_service
 
     def handle(self, task: Task, workspace: Path, **kwargs) -> PhaseResult:
-        # 1. 检查配置是否跳过此阶段
+        # 1. L0 默认跳过（优先于全局 enable 检查，确保 L0 skip reason 明确）
+        if task.level == "L0" and not cfg_bool("features.architect_planning_for_l0", False):
+            logger.info("L0 task skips architect_planning for %s", task.task_id)
+            return PhaseResult(State.CODING, "L0 skip: architect_planning_for_l0 disabled")
+
+        # 2. 检查配置是否全局禁用此阶段
         if cfg_bool("features.architect_planning_enabled", True) is False:
             logger.info("Architect planning disabled by config for %s", task.task_id)
             return PhaseResult(State.CODING, "architect_planning skipped by config")
 
-        # L0 默认跳过（可通过配置覆盖）
-        if task.level == "L0" and not cfg_bool("features.architect_planning_for_l0", False):
-            logger.info("L0 task skips architect_planning for %s", task.task_id)
-            return PhaseResult(State.CODING, "L0 fast path: skip architect_planning")
+        # 3. 重试次数检查（超出上限时直接抛出 fatal error）
+        max_retries = cfg_int("features.architect_planning_max_retry", 2)
+        current_round = task.phase_counters.get("architect_planning", 0)
+        if current_round >= max_retries:
+            from engine.exceptions import AgentFatalError
+            raise AgentFatalError(
+                f"architect_planning max retries exceeded ({current_round}/{max_retries})"
+            )
 
         # 2. 构建上下文
         context = self._build_context(task, workspace)
@@ -192,18 +201,64 @@ class ArchitectPlanningHandler(PhaseHandler):
 """
 
     def _save_artifacts(self, output: str, workspace: Path) -> None:
-        """从 AI 输出中提取并保存三个产物文件。"""
+        """从 AI 输出中提取并保存产物文件。
+        优先解析 === FILE: path === 格式；回退到 ## Plan / ## Design / ## Uncertainty Check 章节格式。
+        """
         files = self._extract_file_blocks(output)
+
+        # 回退：从 Markdown 章节格式提取
+        if not files:
+            files = self._extract_markdown_sections(output)
 
         for filename, content in files.items():
             path = workspace / filename
             path.write_text(content, encoding="utf-8")
             logger.info("Saved %s (%d chars)", filename, len(content))
 
-        # 如果没有解析到，保存原始输出供调试
         if not files:
             (workspace / "architect_planning_raw.md").write_text(output, encoding="utf-8")
             logger.warning("Could not parse structured output, saved raw to architect_planning_raw.md")
+
+    @staticmethod
+    def _extract_markdown_sections(text: str) -> dict[str, str]:
+        """从 Markdown 章节格式提取 plan.md / design.md / uncertainty_check.json。"""
+        result: dict[str, str] = {}
+
+        # ## Plan → plan.md
+        m = re.search(r"##\s*Plan\b(.*?)(?=\n##\s|\Z)", text, re.DOTALL | re.IGNORECASE)
+        if m:
+            result["plan.md"] = m.group(1).strip()
+
+        # ## Design → design.md
+        m = re.search(r"##\s*Design\b(.*?)(?=\n##\s|\Z)", text, re.DOTALL | re.IGNORECASE)
+        if m:
+            result["design.md"] = m.group(1).strip()
+
+        # ## Uncertainty Check → uncertainty_check.json（提取 JSON code block）
+        m = re.search(
+            r"##\s*Uncertainty Check\b.*?```(?:json)?\s*\n(.*?)\n```",
+            text, re.DOTALL | re.IGNORECASE,
+        )
+        if m:
+            try:
+                json.loads(m.group(1).strip())  # validate
+                result["uncertainty_check.json"] = m.group(1).strip()
+            except json.JSONDecodeError:
+                pass
+        # 也尝试直接解析紧跟在 Uncertainty Check 后的裸 JSON
+        if "uncertainty_check.json" not in result:
+            m = re.search(
+                r"##\s*Uncertainty Check\b\s*\n\s*(\{.*?\})",
+                text, re.DOTALL | re.IGNORECASE,
+            )
+            if m:
+                try:
+                    json.loads(m.group(1).strip())
+                    result["uncertainty_check.json"] = m.group(1).strip()
+                except json.JSONDecodeError:
+                    pass
+
+        return result
 
     @staticmethod
     def _extract_file_blocks(text: str) -> dict[str, str]:
@@ -220,17 +275,25 @@ class ArchitectPlanningHandler(PhaseHandler):
         return result
 
     @staticmethod
-    def _parse_uncertainties(workspace: Path) -> list[dict[str, Any]]:
-        """解析 uncertainty_check.json 中的不确定性列表。"""
+    def _parse_uncertainty_check(workspace: Path) -> dict[str, Any]:
+        """解析 uncertainty_check.json，返回完整结构 {"uncertainties": [...], "blocking": bool}。"""
         path = workspace / "uncertainty_check.json"
         if not path.exists():
-            return []
+            return {"uncertainties": [], "blocking": False}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return data.get("uncertainties", [])
+            return {
+                "uncertainties": data.get("uncertainties", []),
+                "blocking": bool(data.get("blocking", False)),
+            }
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning("Failed to parse uncertainty_check.json: %s", e)
-            return []
+            return {"uncertainties": [], "blocking": False}
+
+    @classmethod
+    def _parse_uncertainties(cls, workspace: Path) -> list[dict[str, Any]]:
+        """解析 uncertainty_check.json 中的不确定性列表。"""
+        return cls._parse_uncertainty_check(workspace)["uncertainties"]
 
     def _enter_code_clarification(
         self,
@@ -261,7 +324,7 @@ class ArchitectPlanningHandler(PhaseHandler):
             "timestamp": datetime.now().isoformat(),
             "uncertainties": uncertainties,
         })
-        task.clarification_type = "code"
+        task.clarification_type = "plan"
         save_task(task)
 
         if self._notify:

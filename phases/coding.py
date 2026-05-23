@@ -498,21 +498,37 @@ class CodingHandler(PhaseHandler):
 
     @staticmethod
     def _build_coding_prompt(task: Task, workspace: Path) -> str:
-        return f"""
+        base_rules = """要求:
+1. 所有路径相对于 Android 工程根目录（含 app/、buildSrc/ 的那一层），不要用 AICodeAgent/ 前缀
+2. 严格使用 === FILE: <相对路径> === 与 === END FILE === 包裹每个文件
+3. 不要运行 Gradle 或 git 命令
+4. 不要修改与需求无关的文件
+5. 使用 TextUtils.equals() 进行 site enName 比较"""
+
+        is_vippager = (
+            task.level == "L0"
+            and "vippager" in task.raw_requirement.lower().replace(" ", "")
+            and any(k in task.raw_requirement.lower() for k in ("渐变", "颜色", "滑动", "pager", "colour"))
+        )
+
+        if is_vippager:
+            return f"""
 需求: {task.raw_requirement}
 
 目标文件（必须修改）:
 === FILE: {_TARGET_VIP_FILE} ===
 （输出该文件完整内容，不要用 diff）
 
-要求:
-1. 所有路径相对于 Android 工程根目录（含 app/、buildSrc/ 的那一层），不要用 AICodeAgent/ 前缀
-2. 严格使用 === FILE: <相对路径> === 与 === END FILE === 包裹每个文件
-3. 不要运行 Gradle 或 git 命令
-4. 不要修改与需求无关的文件
-5. 使用 TextUtils.equals() 进行 site enName 比较
+{base_rules}
 6. VIPPager 顶栏渐变：用 pagerState.currentPage + currentPageOffsetFraction 算 scrollProgress，
    dragLeftIndex = scrollProgress.toInt()，pageOffsetState = 小数部分；勿用 floor(pageOffset)+currentPage+1
+
+请直接输出代码文件块，不要只写分析说明。
+"""
+        return f"""
+需求: {task.raw_requirement}
+
+{base_rules}
 
 请直接输出代码文件块，不要只写分析说明。
 """

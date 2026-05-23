@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from engine.exceptions import AgentFatalError, AgentRecoverableError, TaskCancelledError
 from utils.logging_config import get_logger
@@ -19,7 +19,9 @@ from utils.phase_status import write_phase_status
 from utils.tracing import trace_task
 from utils.task_cancel import is_task_cancelled, raise_if_cancelled
 from engine.state_machine import State, Task, get_task, save_task, transition
-from phases.base import PhaseHandler, PhaseResult
+
+if TYPE_CHECKING:
+    from phases.base import PhaseHandler, PhaseResult
 
 logger = get_logger(__name__)
 
@@ -185,6 +187,7 @@ class AgentEngine:
         current = State(task.current_state)
         tracer = getattr(self, "_current_tracer", None)
 
+        from phases.base import PhaseResult  # local import breaks engine↔phases circular dep
         try:
             raise_if_cancelled(task_id)
             write_phase_status(workspace, current.value, f"正在执行：{_phase_label(current.value)}")

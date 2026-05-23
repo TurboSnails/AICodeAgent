@@ -87,7 +87,7 @@ class TestConfigLoading:
         Config._instance = None
         c = get_config()
         assert c.get_str("ai.claude_model") == ""  # 默认留空，由 Claude Code 自行决定
-        assert c.get_int("timeouts.debate") == 600
+        assert c.get_int("timeouts.debate") == 1200
         assert c.get_float("retries.base_delay") == 3.0
         assert c.get_bool("crg.auto_start") is False
         Config._instance = None

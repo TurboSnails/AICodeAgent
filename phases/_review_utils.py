@@ -161,38 +161,28 @@ def parse_codex_verdict(output: str) -> bool:
     return False
 
 
-def parse_and_save_fix_plan(output: str, workspace: Path) -> FixPlan:
+def parse_and_save_fix_plan(output: str, workspace: Path) -> FixPlan | None:
     """
-    从 Review 报告中解析 FixPlan，保存到 fix_plan.md。
-    尝试提取 JSON block 中的 FixPlan，失败时回退到文本解析。
+    从 Review 报告中解析 FixPlan，保存到 fix_plan.json。
+    无法解析出任何条目时返回 None。
     """
-    # 先尝试从 JSON block 提取
-    json_blocks = re.findall(r"```(?:json)?\s*\n(.*?)\n```", output, re.DOTALL)
-    for block in json_blocks:
-        try:
-            data = json.loads(block.strip())
-            if isinstance(data, dict) and "items" in data:
-                plan = FixPlan.from_dict(data)
-                plan.write(workspace / "fix_plan.md")
-                return plan
-        except (json.JSONDecodeError, ValueError):
-            continue
-
-    # 回退到文本解析
     plan = parse_fix_plan_from_text(output)
-    plan.write(workspace / "fix_plan.md")
+    if not plan.items:
+        return None
+    plan.write(workspace / "fix_plan.json")
     return plan
 
 
 def build_fix_plan_prompt() -> str:
     """附加在 Review prompt 末尾，要求 AI 输出结构化 FixPlan。"""
     return """
-## 结构化修复计划（FAIL 时必填）
+## Fix Plan（结构化修复计划，FAIL 时必填）
 
-请在报告末尾附加一个 JSON 格式的修复计划块：
+请在报告末尾附加一个 JSON 格式的修复计划块（key 名为 fix_plan）：
 
 ```json
 {
+  "fix_plan": {
   "items": [
     {
       "priority": "critical | high | medium | low",
@@ -215,8 +205,20 @@ def build_fix_plan_prompt() -> str:
 
 
 def merge_review_fix_plans(workspace: Path) -> FixPlan | None:
-    """合并所有 Review 阶段产生的 fix_plan，返回合并后的 FixPlan。"""
+    """合并所有 Review 阶段产生的 fix_plan，返回合并后的 FixPlan。
+    同时扫描 *_fix_plan.json 文件（来自各 review 阶段直接生成的 JSON）。
+    """
+    from phases._fix_plan import FixPlan as _FP, merge_fix_plans
+
     plans = []
+
+    # 扫描 *_fix_plan.json（优先）
+    for p in sorted(workspace.glob("*_fix_plan.json")):
+        loaded = _FP.read(p)
+        if loaded.items:
+            plans.append(loaded)
+
+    # 扫描 review 文本文件，解析其中的 FixPlan
     for name in ["codex_review.md", "red_team_audit.md", "requirement_review.md"]:
         path = workspace / name
         if path.exists():
@@ -226,13 +228,11 @@ def merge_review_fix_plans(workspace: Path) -> FixPlan | None:
                 plans.append(plan)
 
     if not plans:
-        # 尝试读取已有的 fix_plan.md
         fp = workspace / "fix_plan.md"
         if fp.exists():
-            return FixPlan.read(fp)
+            return _FP.read(fp)
         return None
 
-    from phases._fix_plan import merge_fix_plans
     merged = merge_fix_plans(*plans)
     merged.write(workspace / "fix_plan.md")
     return merged

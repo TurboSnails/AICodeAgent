@@ -27,11 +27,11 @@ class MockAIClient:
         self._response = response
         self.calls: list[tuple[str, str]] = []
 
-    def call(self, prompt: str, context: str = "", timeout: int = 300) -> str:
+    def call(self, prompt: str, context: str = "", timeout: int = 300, **kwargs) -> str:
         self.calls.append((prompt[:100], context[:100]))
         return self._response
 
-    def call_codex(self, prompt: str, context: str = "", timeout: int = 300) -> str:
+    def call_codex(self, prompt: str, context: str = "", timeout: int = 300, **kwargs) -> str:
         return self.call(prompt, context, timeout)
 
 
@@ -78,10 +78,10 @@ class TestEngineSmoke:
     """AgentEngine + PhaseHandler 集成冒烟测试"""
 
     def test_build_engine_registers_all_handlers(self):
-        """build_engine() 应成功注册全部 14 个 handler"""
+        """build_engine() 应成功注册全部 16 个 handler"""
         engine = build_engine()
         handlers = engine.list_registered()
-        assert len(handlers) == 14
+        assert len(handlers) == 16
         for state in [
             "planning", "debating", "consensus", "coding",
             "building", "self_review", "codex_review", "architect_review",
@@ -174,6 +174,8 @@ class TestEngineSmoke:
 class MockGitService:
     """Git 操作 stub"""
 
+    from utils.paths import PROJECT_ROOT as project_root
+
     def get_current_branch(self) -> str:
         return "main"
 
@@ -187,6 +189,15 @@ class MockGitService:
         for m in re.finditer(r"===\s*FILE:\s*(.+?)\s*===", claude_output):
             applied.append(m.group(1).strip())
         return applied, []
+
+    def list_worktree_changed_paths(self):
+        return []
+
+    def partition_changed_paths(self, paths):
+        return paths, []
+
+    def _run_cmd(self, cmd, **kwargs):
+        pass
 
     def commit_from_consensus(self, *args, **kwargs) -> None:
         pass
