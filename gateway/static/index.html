@@ -270,11 +270,11 @@
 let _lsLoaded = false;
 
 function openLangsmithModal() {
-  document.getElementById('langsmithModal').classList.add('open');
+  document.getElementById('langsmithModal').classList.add('show');
   if (!_lsLoaded) loadLangsmithInfo();
 }
 function closeLangsmithModal() {
-  document.getElementById('langsmithModal').classList.remove('open');
+  document.getElementById('langsmithModal').classList.remove('show');
 }
 
 async function loadLangsmithInfo() {
@@ -393,6 +393,7 @@ async function loadLangsmithInfo() {
 document.getElementById('langsmithModal').addEventListener('click', function(e) {
   if (e.target === this) closeLangsmithModal();
 });
+
 </script>
 
 <script src="/static/js/activity-ui.js?v=2"></script>
