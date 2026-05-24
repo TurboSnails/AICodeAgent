@@ -5,6 +5,15 @@ set -euo pipefail
 # 启动所有服务：Web UI、Telegram Bot、Serial Executor
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# 加载本地私密配置（不进 git）
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+  set -o allexport
+  # shellcheck source=/dev/null
+  source "$SCRIPT_DIR/.env"
+  set +o allexport
+fi
+
 # shellcheck source=install/lib/agent_paths.sh
 source "$SCRIPT_DIR/install/lib/agent_paths.sh"
 

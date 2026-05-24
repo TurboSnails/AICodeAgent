@@ -245,6 +245,11 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 ctx.status = 200
                 return
 
+            if path == "/api/langsmith/info":
+                self._json(_langsmith_info())
+                ctx.status = 200
+                return
+
             if path == "/tasks":
                 tasks = self._task_service.list_tasks(limit=50)
                 self._json({"tasks": [_task_to_dict(t) for t in tasks]})
@@ -876,6 +881,113 @@ def _load_task_activity(task) -> dict:
     if snippets:
         result["ai_output_preview"] = "\n".join(snippets)
     return result
+
+
+# ------------------------------------------------------------------
+# LangSmith 可观测性信息接口
+# ------------------------------------------------------------------
+
+def _langsmith_info() -> dict:
+    """
+    返回 LangSmith 追踪状态与最近任务 Runs。
+    lazy import：未安装 langsmith 或未配置 API Key 时安全降级。
+    """
+    import os as _os
+
+    api_key = _os.environ.get("LANGCHAIN_API_KEY", "").strip()
+    project = _os.environ.get("LANGCHAIN_PROJECT", "AICodeAgent").strip() or "AICodeAgent"
+
+    base: dict = {
+        "enabled": bool(api_key),
+        "api_key_set": bool(api_key),
+        "project": project,
+        "dashboard_url": f"https://smith.langchain.com" if not api_key else (
+            f"https://smith.langchain.com/projects/p/{project}"
+        ),
+        "runs": [],
+        "error": None,
+    }
+
+    if not api_key:
+        base["error"] = "未配置 LANGCHAIN_API_KEY，LangSmith 追踪未启用"
+        return base
+
+    try:
+        from langsmith import Client  # type: ignore
+        client = Client(api_key=api_key)
+
+        # 只拉根节点（task 级），最近 20 条，按开始时间倒序
+        runs_iter = client.list_runs(
+            project_name=project,
+            is_root=True,
+            run_type="chain",
+            limit=20,
+            select=["id", "name", "status", "start_time", "end_time",
+                    "total_cost", "error", "outputs", "url"],
+        )
+
+        runs_out = []
+        for run in runs_iter:
+            # 解析 task_id（name 格式 "task-{task_id}"）
+            name = getattr(run, "name", "") or ""
+            task_id = name.removeprefix("task-") if name.startswith("task-") else name
+
+            start = getattr(run, "start_time", None)
+            end = getattr(run, "end_time", None)
+            duration_s: float | None = None
+            if start and end:
+                try:
+                    duration_s = round((end - start).total_seconds(), 1)
+                except Exception:
+                    pass
+
+            cost = getattr(run, "total_cost", None)
+
+            # 终态从 outputs 读取
+            outputs = getattr(run, "outputs", {}) or {}
+            terminal_state = outputs.get("terminal_state", "")
+            branch = outputs.get("branch", "")
+            pr_url = outputs.get("pr_url", "")
+
+            # run 的 LangSmith 直链
+            try:
+                run_url = client.get_run_url(run=run, project_name=project)
+            except Exception:
+                run_url = base["dashboard_url"]
+
+            runs_out.append({
+                "id": str(getattr(run, "id", "")),
+                "name": name,
+                "task_id": task_id,
+                "status": getattr(run, "status", ""),
+                "start_time": start.isoformat() if start else "",
+                "end_time": end.isoformat() if end else "",
+                "duration_s": duration_s,
+                "cost_usd": round(float(cost), 4) if cost else None,
+                "terminal_state": terminal_state,
+                "branch": branch,
+                "pr_url": pr_url,
+                "error": (getattr(run, "error", None) or "")[:200],
+                "run_url": run_url,
+            })
+
+        base["runs"] = runs_out
+        # 更新精确的 dashboard URL（包含 org 信息）
+        try:
+            projects = list(client.list_projects(project_name=project, limit=1))
+            if projects:
+                pid = str(projects[0].id)
+                base["dashboard_url"] = f"https://smith.langchain.com/o/me/projects/p/{pid}"
+        except Exception:
+            pass
+
+    except ImportError:
+        base["enabled"] = False
+        base["error"] = "langsmith 未安装，请运行：pip install langsmith"
+    except Exception as exc:
+        base["error"] = f"LangSmith API 调用失败：{exc}"
+
+    return base
 
 
 # 兼容旧版入口：直接运行此文件时启动 HTTP 服务器

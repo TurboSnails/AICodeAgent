@@ -18,6 +18,10 @@
       <span class="logo-name">CodeAgent</span>
     </a>
     <div class="header-right">
+      <button type="button" class="orphan-btn" id="langsmithBtn" onclick="openLangsmithModal()" title="LangSmith 可观测性">
+        <span id="langsmithDot" class="ls-dot ls-dot-off"></span>
+        <span>📊 追踪</span>
+      </button>
       <button type="button" class="orphan-btn" id="orphanBtn" onclick="openOrphanModal()" title="垃圾任务监控">
         <span id="orphanDot"></span>
         <span id="orphanLabel">🧹 垃圾任务</span>
@@ -155,6 +159,241 @@
     </div>
   </div>
 </div>
+
+<!-- ───────────────── LangSmith 追踪弹窗 ───────────────── -->
+<div class="modal" id="langsmithModal">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-head">
+      <h3>📊 LangSmith 可观测性</h3>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="closeLangsmithModal()">关闭</button>
+    </div>
+
+    <!-- 状态卡片 -->
+    <div class="ls-status-card" id="lsStatusCard">
+      <div class="ls-status-row">
+        <span class="ls-badge" id="lsBadge">检测中…</span>
+        <span class="ls-project" id="lsProject"></span>
+        <a class="btn btn-sm btn-ghost ls-dash-link" id="lsDashLink" href="#" target="_blank" hidden>
+          🔗 打开 LangSmith 控制台
+        </a>
+      </div>
+      <p class="ls-hint" id="lsHint"></p>
+    </div>
+
+    <!-- 最近 Runs 列表 -->
+    <div class="modal-body" id="lsRunsWrap">
+      <p class="empty" id="lsRunsEmpty">加载中…</p>
+      <table class="ls-table" id="lsTable" hidden>
+        <thead>
+          <tr>
+            <th>任务 ID</th>
+            <th>状态</th>
+            <th>开始时间</th>
+            <th>耗时</th>
+            <th>费用</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="lsTableBody"></tbody>
+      </table>
+    </div>
+
+    <div class="modal-foot">
+      <button type="button" class="btn btn-secondary btn-sm" onclick="loadLangsmithInfo()">🔄 刷新</button>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="closeLangsmithModal()">关闭</button>
+    </div>
+  </div>
+</div>
+
+<style>
+/* ── LangSmith 专用样式 ── */
+.ls-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; flex-shrink:0; }
+.ls-dot-on  { background:#22c55e; box-shadow:0 0 6px #22c55e88; }
+.ls-dot-off { background:#6b7280; }
+.ls-dot-err { background:#ef4444; }
+
+.ls-status-card {
+  background: var(--surface,#1e1e2e);
+  border: 1px solid var(--border,#2d2d3f);
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin: 0 20px 4px;
+}
+.ls-status-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.ls-badge {
+  font-size: 12px; font-weight: 600; padding: 3px 10px;
+  border-radius: 20px; white-space: nowrap;
+}
+.ls-badge-on  { background:#14532d33; color:#4ade80; border:1px solid #16a34a44; }
+.ls-badge-off { background:#27272a; color:#9ca3af; border:1px solid #3f3f46; }
+.ls-badge-err { background:#450a0a33; color:#f87171; border:1px solid #ef444444; }
+.ls-project { font-size:13px; color:var(--text-muted,#888); font-family:monospace; }
+.ls-dash-link { text-decoration:none; font-size:12px; }
+.ls-hint { margin:8px 0 0; font-size:12px; color:var(--text-muted,#888); line-height:1.5; }
+.ls-hint code { background:#2d2d3f; padding:1px 5px; border-radius:4px; font-size:11px; }
+
+.ls-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+  margin-top: 4px;
+}
+.ls-table th {
+  text-align: left; padding: 8px 12px; font-size:11px; font-weight:600;
+  color: var(--text-muted,#888); text-transform:uppercase; letter-spacing:.05em;
+  border-bottom: 1px solid var(--border,#2d2d3f);
+}
+.ls-table td {
+  padding: 9px 12px; border-bottom: 1px solid var(--border,#2d2d3f);
+  vertical-align: middle;
+}
+.ls-table tr:last-child td { border-bottom: none; }
+.ls-table tr:hover td { background: var(--hover,#ffffff08); }
+
+.ls-task-id { font-family:monospace; font-size:12px; color:var(--text-muted,#aaa); }
+.ls-state-chip {
+  display: inline-flex; align-items:center; gap:4px;
+  font-size: 11px; font-weight:600; padding: 2px 8px; border-radius:12px;
+}
+.ls-state-completed { background:#14532d33; color:#4ade80; }
+.ls-state-failed    { background:#450a0a33; color:#f87171; }
+.ls-state-cancelled { background:#27272a;   color:#9ca3af; }
+.ls-state-running   { background:#1e3a5f33; color:#60a5fa; }
+.ls-state-other     { background:#27272a;   color:#d1d5db; }
+
+.ls-cost { font-size:12px; color:var(--text-muted,#888); }
+.ls-open-btn { font-size:11px; padding:3px 8px; }
+
+.modal-foot { padding: 12px 20px; display:flex; gap:8px; justify-content:flex-end; border-top:1px solid var(--border,#2d2d3f); }
+</style>
+
+<script>
+// ── LangSmith 弹窗逻辑 ──────────────────────────────────────────
+let _lsLoaded = false;
+
+function openLangsmithModal() {
+  document.getElementById('langsmithModal').classList.add('open');
+  if (!_lsLoaded) loadLangsmithInfo();
+}
+function closeLangsmithModal() {
+  document.getElementById('langsmithModal').classList.remove('open');
+}
+
+async function loadLangsmithInfo() {
+  _lsLoaded = true;
+  const empty = document.getElementById('lsRunsEmpty');
+  const table = document.getElementById('lsTable');
+  const tbody = document.getElementById('lsTableBody');
+  empty.textContent = '加载中…';
+  empty.hidden = false;
+  table.hidden = true;
+
+  let data;
+  try {
+    const resp = await fetch('/api/langsmith/info');
+    data = await resp.json();
+  } catch(e) {
+    empty.textContent = '请求失败：' + e.message;
+    return;
+  }
+
+  // ── 状态卡片 ──
+  const dot    = document.getElementById('langsmithDot');
+  const badge  = document.getElementById('lsBadge');
+  const proj   = document.getElementById('lsProject');
+  const hint   = document.getElementById('lsHint');
+  const dashA  = document.getElementById('lsDashLink');
+
+  if (data.enabled) {
+    dot.className   = 'ls-dot ls-dot-on';
+    badge.className = 'ls-badge ls-badge-on';
+    badge.textContent = '✓ 追踪已启用';
+    proj.textContent  = '项目：' + data.project;
+    dashA.href = data.dashboard_url;
+    dashA.hidden = false;
+    hint.textContent = '';
+  } else {
+    dot.className   = 'ls-dot ls-dot-off';
+    badge.className = 'ls-badge ls-badge-off';
+    badge.textContent = '● 追踪未启用';
+    proj.textContent  = '';
+    dashA.hidden = true;
+    hint.innerHTML = data.error
+      ? data.error + '<br>在 <code>config/local.yaml</code> 或环境变量中设置：<br>'
+        + '<code>LANGCHAIN_API_KEY=ls__...</code>&nbsp;&nbsp;<code>LANGCHAIN_PROJECT=AICodeAgent</code>'
+      : '';
+  }
+
+  if (data.error && data.enabled) {
+    badge.className = 'ls-badge ls-badge-err';
+    badge.textContent = '⚠ 连接异常';
+    hint.textContent = data.error;
+  }
+
+  // ── Runs 列表 ──
+  const runs = data.runs || [];
+  if (!runs.length) {
+    empty.textContent = data.enabled
+      ? '暂无追踪记录（尚未运行过任务，或项目名称不匹配）'
+      : '启用 LangSmith 后即可查看追踪';
+    return;
+  }
+
+  tbody.innerHTML = '';
+  for (const r of runs) {
+    const stateIcon = {
+      completed:'✅', failed:'❌', cancelled:'🚫'
+    }[r.terminal_state] || (r.status === 'success' ? '✅' : r.status === 'error' ? '❌' : '⏳');
+
+    const stateClass = {
+      completed:'ls-state-completed', failed:'ls-state-failed',
+      cancelled:'ls-state-cancelled',
+    }[r.terminal_state] || (r.status === 'running' ? 'ls-state-running' : 'ls-state-other');
+
+    const stateLabel = {
+      completed:'已完成', failed:'失败', cancelled:'已取消',
+    }[r.terminal_state] || r.status || '运行中';
+
+    const startStr = r.start_time
+      ? new Date(r.start_time).toLocaleString('zh-CN',{hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})
+      : '—';
+
+    const durStr = r.duration_s != null
+      ? (r.duration_s >= 60 ? Math.round(r.duration_s/60)+'m' : r.duration_s+'s')
+      : '—';
+
+    const costStr = r.cost_usd != null
+      ? '$' + r.cost_usd.toFixed(4)
+      : '—';
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>
+        <span class="ls-task-id" title="${r.task_id}">${r.task_id.slice(0,12)}…</span>
+        ${r.branch ? '<br><small style="color:#6b7280;font-size:10px">🌿 '+r.branch+'</small>' : ''}
+      </td>
+      <td><span class="ls-state-chip ${stateClass}">${stateIcon} ${stateLabel}</span></td>
+      <td style="font-size:12px;color:#9ca3af">${startStr}</td>
+      <td style="font-size:12px;color:#9ca3af">${durStr}</td>
+      <td class="ls-cost">${costStr}</td>
+      <td>
+        ${r.run_url
+          ? `<a class="btn btn-sm btn-ghost ls-open-btn" href="${r.run_url}" target="_blank">🔍 查看</a>`
+          : ''}
+        ${r.pr_url
+          ? `<a class="btn btn-sm btn-ghost ls-open-btn" href="${r.pr_url}" target="_blank">🔗 PR</a>`
+          : ''}
+      </td>`;
+    tbody.appendChild(tr);
+  }
+
+  empty.hidden = true;
+  table.hidden = false;
+}
+
+// ── 关闭弹窗点击背景 ──
+document.getElementById('langsmithModal').addEventListener('click', function(e) {
+  if (e.target === this) closeLangsmithModal();
+});
+</script>
 
 <script src="/static/js/activity-ui.js?v=2"></script>
 <script src="/static/js/app.js?v=7"></script>
