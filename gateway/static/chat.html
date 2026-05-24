@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AICodeAgent</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/chat.css?v=1">
+</head>
+<body>
+
+<div class="app-layout">
+
+  <!-- ═══ Sidebar ═══ -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <a class="logo" href="/static/chat.html">
+        <span class="logo-icon">AI</span>
+        <span class="logo-name">CodeAgent</span>
+      </a>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="health-dot" id="healthDot" title="服务状态"></div>
+        <button type="button" class="new-task-btn" id="newTaskBtn" onclick="startNewTask()">+ 新建</button>
+      </div>
+    </div>
+
+    <div class="sidebar-tasks" id="sidebarTasks">
+      <div class="sidebar-empty">加载中…</div>
+    </div>
+  </aside>
+
+  <!-- ═══ Main ═══ -->
+  <main class="chat-main">
+
+    <!-- Header bar -->
+    <div class="chat-header" id="chatHeader">
+      <span class="chat-header-title" id="chatHeaderTitle">AICodeAgent</span>
+      <span class="chat-header-status" id="chatHeaderStatus"></span>
+      <div class="chat-header-actions" id="chatHeaderActions"></div>
+    </div>
+
+    <!-- Welcome screen -->
+    <div class="chat-welcome" id="chatWelcome">
+      <div class="welcome-icon">🤖</div>
+      <h1 class="welcome-title">有什么需要开发的？</h1>
+      <p class="welcome-sub">描述需求，AI 会自动规划、编码、构建并提交代码。可以粘贴截图或设计稿。</p>
+      <div class="welcome-tips">
+        <span class="tip-chip" onclick="fillTip(this)">帮我新增一个页面功能</span>
+        <span class="tip-chip" onclick="fillTip(this)">修改登录页样式</span>
+        <span class="tip-chip" onclick="fillTip(this)">review 最近的代码改动</span>
+        <span class="tip-chip" onclick="fillTip(this)">解释一下这段代码</span>
+      </div>
+    </div>
+
+    <!-- Chat thread -->
+    <div class="chat-thread" id="chatThread" style="display:none">
+      <div class="chat-messages" id="chatMessages"></div>
+    </div>
+
+    <!-- Input area (always visible) -->
+    <div class="chat-input-area" id="chatInputArea">
+      <div class="attachment-preview" id="attachmentPreview"></div>
+      <div class="input-row">
+        <button type="button" class="btn-attach" id="btnAttach" onclick="triggerAttach()" title="附加图片 (或直接粘贴)">📎</button>
+        <input type="file" id="fileInput" accept="image/*" multiple style="display:none" onchange="onFileSelect(event)">
+        <textarea
+          id="msgInput"
+          class="msg-textarea"
+          placeholder="描述需求，可粘贴截图…"
+          rows="1"
+        ></textarea>
+        <div class="input-controls">
+          <select id="levelSelect" class="level-select" title="任务规模">
+            <option value="auto">自动</option>
+            <option value="L0">小改</option>
+            <option value="L1">功能</option>
+            <option value="L2">大改</option>
+          </select>
+          <button type="button" class="btn-send" id="btnSend" onclick="onSend()">发送</button>
+        </div>
+      </div>
+      <div class="input-hint" id="inputHint">Ctrl+Enter 提交 · 可粘贴图片</div>
+    </div>
+
+  </main>
+</div>
+
+<!-- Toast container -->
+<div id="toast-container"></div>
+
+<script src="/static/js/chat.js?v=1"></script>
+</body>
+</html>

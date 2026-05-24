@@ -4,27 +4,34 @@ Web UI 网关 — V4 重构适配器
 向后兼容 gateway/web_ui_v2.py 的 HTTP 接口，内部委托给 TaskService。
 
 提供路由：
-  GET  /                     — 重定向到 /static/index.html
-  GET  /health               — 健康检查
-  GET  /tasks                — 任务列表
-  GET  /task/:id             — 任务详情
-  GET  /task/:id/history     — 状态流转历史
-  GET  /static/*             — 静态文件服务
-  POST /api/task             — 提交任务
-  POST /api/continue/:id     — L2 核准
-  POST /api/reply/:id        — 需求澄清回复
-  POST /api/cancel/:id       — 取消任务
+  GET  /                         — 重定向到 /static/chat.html
+  GET  /health                   — 健康检查
+  GET  /tasks                    — 任务列表
+  GET  /task/:id                 — 任务详情
+  GET  /task/:id/history         — 状态流转历史
+  GET  /static/*                 — 静态文件服务
+  GET  /uploads/:filename        — 上传图片服务
+  GET  /api/stream/:id           — SSE 实时任务流
+  POST /api/task                 — 提交任务（支持 image_urls）
+  POST /api/continue/:id         — L2 核准
+  POST /api/reply/:id            — 需求澄清回复（支持 image_urls）
+  POST /api/cancel/:id           — 取消任务
+  POST /api/upload               — 上传图片（base64 JSON）
+  POST /api/cleanup/:id          — 强制清理垃圾任务
 """
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import http.server
 import json
 import mimetypes
 import os
 import re
+import socketserver
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -49,6 +56,10 @@ from utils.paths import PROJECT_ROOT
 # 静态文件根目录
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+# 上传图片目录
+UPLOADS_DIR = DATA_DIR / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
 # Executor 运行时文件（用于判断是否有执行器在跑）
 LOCK_FILE = DATA_DIR / "executor.lock"
 CURRENT_TASK_FILE = DATA_DIR / "executor.current_task"
@@ -59,6 +70,9 @@ ORPHAN_IDLE_THRESHOLD = 600  # 10 分钟
 # 终态与等待态
 _TERMINAL_STATES = {"completed", "failed", "cancelled"}
 _WAITING_STATES = {"waiting_gate", "waiting_clarification"}
+
+# SSE 流最大持续时间（秒）
+_SSE_MAX_SECONDS = 600
 
 
 def _auth_ok(headers: dict[str, str]) -> bool:
@@ -122,6 +136,78 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(safe_path.read_bytes())
 
     # ------------------------------------------------------------------
+    # SSE 实时任务流
+    # ------------------------------------------------------------------
+
+    def _handle_sse(self, task_id: str) -> None:
+        """Server-Sent Events：实时推送任务状态变更和编码日志。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def _emit(data: dict) -> bool:
+            try:
+                line = "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
+                self.wfile.write(line.encode("utf-8"))
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return False
+
+        last_state: str | None = None
+        last_activity_hash: int | None = None
+        log_offset: int = 0
+        deadline = time.monotonic() + _SSE_MAX_SECONDS
+
+        try:
+            while time.monotonic() < deadline:
+                task = self._task_service.get_task(task_id)
+                if not task:
+                    _emit({"type": "error", "error": "task not found"})
+                    break
+
+                # 编码日志增量推送
+                if task.current_state == "coding":
+                    log_path = WORKSPACE_ROOT / task_id / "coding_cli.log"
+                    if log_path.is_file():
+                        try:
+                            content = log_path.read_text(encoding="utf-8", errors="replace")
+                            new_text = content[log_offset:]
+                            if new_text:
+                                log_offset = len(content)
+                                if not _emit({"type": "log", "text": new_text}):
+                                    break
+                        except OSError:
+                            pass
+
+                # 状态或 activity 有变化时推送完整快照
+                state = task.current_state
+                activity = _load_task_activity(task)
+                activity_hash = hash(json.dumps(activity, sort_keys=True, ensure_ascii=False))
+
+                if state != last_state or activity_hash != last_activity_hash:
+                    last_state = state
+                    last_activity_hash = activity_hash
+                    payload: dict = {**_task_to_dict(task), **activity, "type": "state"}
+                    # 附带图片引用
+                    payload["image_urls"] = _load_image_refs(task_id)
+                    if not _emit(payload):
+                        break
+
+                # 终态：再推一次 done 并退出
+                if state in _TERMINAL_STATES:
+                    _emit({"type": "done"})
+                    break
+
+                time.sleep(1)
+        except Exception:
+            pass  # 连接断开或其他异常，静默退出
+
+    # ------------------------------------------------------------------
     # CORS 预检
     # ------------------------------------------------------------------
 
@@ -143,7 +229,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
             if path == "/":
                 self.send_response(301)
-                self.send_header("Location", "/static/index.html")
+                self.send_header("Location", "/static/chat.html")
                 self.end_headers()
                 ctx.status = 301
                 return
@@ -185,6 +271,32 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                     ctx.status = 404
                 return
 
+            # SSE 实时任务流
+            m = re.match(r"/api/stream/([a-zA-Z0-9_-]+)$", path)
+            if m:
+                task_id = m.group(1)
+                self._handle_sse(task_id)
+                ctx.status = 200
+                return
+
+            # 上传图片服务
+            if path.startswith("/uploads/"):
+                filename = path[len("/uploads/"):]
+                if re.match(r"^[a-zA-Z0-9_.-]+$", filename):
+                    img_path = UPLOADS_DIR / filename
+                    if img_path.is_file():
+                        ct, _ = mimetypes.guess_type(str(img_path))
+                        self.send_response(200)
+                        self.send_header("Content-Type", ct or "application/octet-stream")
+                        self.send_header("Cache-Control", "max-age=86400")
+                        self.end_headers()
+                        self.wfile.write(img_path.read_bytes())
+                        ctx.status = 200
+                        return
+                self._json({"error": "not found"}, 404)
+                ctx.status = 404
+                return
+
             # 静态文件服务
             if path.startswith("/static/"):
                 self._serve_static(path[len("/static/"):])
@@ -208,6 +320,29 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             path = parsed.path
 
+            # 图片上传（base64 JSON）
+            if path == "/api/upload":
+                payload = self._read_body()
+                images = payload.get("images") or []
+                saved: list[dict] = []
+                for img in images:
+                    try:
+                        name = (img.get("name") or "image.png").replace("/", "_")
+                        data_b64 = img.get("data") or ""
+                        mime = img.get("mime_type") or "image/png"
+                        ext = name.rsplit(".", 1)[-1].lower() if "." in name else "png"
+                        if ext not in {"png", "jpg", "jpeg", "gif", "webp", "bmp"}:
+                            ext = "png"
+                        file_id = uuid.uuid4().hex[:12]
+                        dest = UPLOADS_DIR / f"{file_id}.{ext}"
+                        dest.write_bytes(base64.b64decode(data_b64))
+                        saved.append({"file_id": file_id, "url": f"/uploads/{file_id}.{ext}", "name": name})
+                    except Exception as exc:
+                        logger.warning("upload error: %s", exc)
+                self._json({"files": saved})
+                ctx.status = 200
+                return
+
             # 提交任务
             if path == "/api/task":
                 payload = self._read_body()
@@ -221,6 +356,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 source = payload.get("source", "web")
                 chat_id = payload.get("chat_id", "")
                 request_type = payload.get("request_type", "")
+                image_urls: list[str] = payload.get("image_urls") or []
                 task = self._task_service.submit_task(
                     requirement=requirement,
                     level=level,
@@ -229,6 +365,9 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                     chat_id=chat_id,
                     request_type=request_type,
                 )
+                # 保存图片引用到工作区（规划阶段可见）
+                if image_urls:
+                    _save_image_refs(task.task_id, image_urls)
                 self._json({"task_id": task.task_id, "level": task.level, "status": task.status, "request_type": task.request_type})
                 ctx.status = 200
                 return
@@ -252,6 +391,9 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                     self._json({"error": "reply is required"}, 400)
                     ctx.status = 400
                     return
+                image_urls_reply: list[str] = payload.get("image_urls") or []
+                if image_urls_reply:
+                    _append_image_refs(task_id, image_urls_reply)
                 ok = self._task_service.submit_clarification(task_id, reply)
                 self._json({"success": ok, "task_id": task_id})
                 ctx.status = 200 if ok else 400
@@ -279,6 +421,40 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
             self._json({"error": "not found"}, 404)
             ctx.status = 404
+
+
+# ------------------------------------------------------------------
+# 图片引用辅助
+# ------------------------------------------------------------------
+
+
+def _save_image_refs(task_id: str, image_urls: list[str]) -> None:
+    """创建任务时，将图片 URL 列表写入工作区 image_refs.json。"""
+    ws = WORKSPACE_ROOT / task_id
+    ws.mkdir(parents=True, exist_ok=True)
+    refs_path = ws / "image_refs.json"
+    try:
+        existing = json.loads(refs_path.read_text()) if refs_path.exists() else []
+        merged = existing + [u for u in image_urls if u not in existing]
+        refs_path.write_text(json.dumps(merged, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def _append_image_refs(task_id: str, image_urls: list[str]) -> None:
+    """澄清回复时，追加图片引用到 image_refs.json。"""
+    _save_image_refs(task_id, image_urls)
+
+
+def _load_image_refs(task_id: str) -> list[str]:
+    """读取任务工作区的图片引用列表。"""
+    refs_path = WORKSPACE_ROOT / task_id / "image_refs.json"
+    try:
+        if refs_path.exists():
+            return json.loads(refs_path.read_text())
+    except Exception:
+        pass
+    return []
 
 
 # ------------------------------------------------------------------
@@ -600,6 +776,7 @@ def _task_to_dict(task) -> dict:
         "clarification_questions": questions,
         "progress": progress,
         "failed_at_state": failed_at,
+        "image_urls": _load_image_refs(task.task_id),
         **phase,
         **artifact,
     }
@@ -703,11 +880,14 @@ def _load_task_activity(task) -> dict:
 
 # 兼容旧版入口：直接运行此文件时启动 HTTP 服务器
 if __name__ == "__main__":
-    import socketserver
-
     PORT = int(os.environ.get("AGENT_WEB_PORT", cfg_str("gateway.web_port", "6789")))
-    class ReusableTCPServer(socketserver.TCPServer):
+
+    class _ThreadingServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        """多线程 TCP 服务器，支持 SSE 长连接与普通请求并发。"""
         allow_reuse_address = True
-    with ReusableTCPServer(("", PORT), lambda *a, **kw: WebUIHandler(*a, task_service=TaskService(), **kw)) as httpd:
-        logger.info("Web UI serving on port %d", PORT)
+        daemon_threads = True  # 主进程退出时不等待 SSE 线程
+
+    _task_svc = TaskService()
+    with _ThreadingServer(("", PORT), lambda *a, **kw: WebUIHandler(*a, task_service=_task_svc, **kw)) as httpd:
+        logger.info("Web UI (threaded) serving on port %d", PORT)
         httpd.serve_forever()

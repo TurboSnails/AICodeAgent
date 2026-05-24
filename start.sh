@@ -20,6 +20,18 @@ echo "========================================"
 : "${ANTHROPIC_DEFAULT_SONNET_MODEL:=claude-sonnet-4-6}"
 export CLAUDE_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
 
+# --- LangSmith 可观测性（设置 LANGCHAIN_API_KEY 即可启用，留空则关闭）---
+# 获取 Key：https://smith.langchain.com → Settings → API Keys
+: "${LANGCHAIN_API_KEY:=}"
+: "${LANGCHAIN_PROJECT:=AICodeAgent}"
+: "${LANGCHAIN_TRACING_V2:=true}"
+export LANGCHAIN_API_KEY LANGCHAIN_PROJECT LANGCHAIN_TRACING_V2
+if [[ -n "${LANGCHAIN_API_KEY}" ]]; then
+  echo "[CHECK] LangSmith tracing ENABLED  (project=${LANGCHAIN_PROJECT})"
+else
+  echo "[CHECK] LangSmith tracing DISABLED (set LANGCHAIN_API_KEY to enable)"
+fi
+
 # orchestrator 的 claude --print：仅用当前 shell 的 ANTHROPIC_*（与 cc-use / IDE 切换无关）
 if [[ -n "${ANTHROPIC_BASE_URL:-}" ]]; then
   echo "[CHECK] ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL CLAUDE_MODEL=${CLAUDE_MODEL:-default}"

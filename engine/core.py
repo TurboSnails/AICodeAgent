@@ -16,7 +16,7 @@ from engine.exceptions import AgentFatalError, AgentRecoverableError, TaskCancel
 from utils.logging_config import get_logger
 from utils.paths import WORKSPACE_ROOT
 from utils.phase_status import write_phase_status
-from utils.tracing import trace_task
+from utils.tracing import trace_task, is_enabled
 from utils.task_cancel import is_task_cancelled, raise_if_cancelled
 from engine.state_machine import State, Task, get_task, save_task, transition
 
@@ -148,6 +148,13 @@ class AgentEngine:
                                 + (f"：{result.reason}" if result.reason else ""),
                             )
                         logger.info("ENGINE END %s -> %s | %s", task_id, result.next_state.value, result.reason)
+                        # LangSmith：写入任务终态
+                        tracer.finish(
+                            terminal_state=result.next_state.value,
+                            error_log=task.error_log or "",
+                            branch=task.branch or "",
+                            pr_url=task.pr_url or "",
+                        )
                         break
 
                     if result.next_state in WAITING_STATES:
@@ -191,8 +198,9 @@ class AgentEngine:
         try:
             raise_if_cancelled(task_id)
             write_phase_status(workspace, current.value, f"正在执行：{_phase_label(current.value)}")
+            # LangSmith：开始阶段 span，写入对排查有用的上下文
             if tracer:
-                tracer.log_phase(current.value, inputs={"task_id": task_id, "state": current.value})
+                tracer.log_phase_start(current.value, inputs=_phase_inputs(task, current.value, workspace))
             handler.on_enter(task, workspace)
             result = handler.handle(task, workspace)
             raise_if_cancelled(task_id)
@@ -202,49 +210,58 @@ class AgentEngine:
                 result.next_state.value,
                 result.reason or _phase_label(result.next_state.value),
             )
+            # LangSmith：关闭阶段 span，写入结果
             if tracer:
-                tracer.log_phase(
+                tracer.log_phase_end(
                     current.value,
-                    outputs={"next_state": result.next_state.value, "reason": result.reason},
+                    outputs=_phase_outputs(task, result, workspace),
                 )
             return result
 
         except TaskCancelledError:
             write_phase_status(workspace, State.CANCELLED.value, "任务已取消")
+            if tracer:
+                tracer.log_phase_end(current.value, error="cancelled")
             raise
 
         except AgentRecoverableError as e:
             if is_task_cancelled(task_id):
                 write_phase_status(workspace, State.CANCELLED.value, "任务已取消")
+                if tracer:
+                    tracer.log_phase_end(current.value, error="cancelled")
                 raise TaskCancelledError(f"task {task_id} cancelled during {current.value}") from e
             logger.warning("Recoverable error in %s: %s", current.value, e)
             task.error_log = str(e)
             save_task(task)
             write_phase_status(workspace, current.value, f"可恢复错误：{e}", extra={"error": str(e)})
             if tracer:
-                tracer.log_phase(current.value, error=str(e))
+                tracer.log_phase_end(current.value, error=str(e))
             return PhaseResult(State.CORRECTING, f"recoverable: {e}")
 
         except AgentFatalError as e:
             if is_task_cancelled(task_id):
                 write_phase_status(workspace, State.CANCELLED.value, "任务已取消")
+                if tracer:
+                    tracer.log_phase_end(current.value, error="cancelled")
                 raise TaskCancelledError(f"task {task_id} cancelled during {current.value}") from e
             logger.error("Fatal error in %s: %s", current.value, e)
             task.error_log = str(e)
             save_task(task)
             if tracer:
-                tracer.log_phase(current.value, error=str(e))
+                tracer.log_phase_end(current.value, error=str(e))
             return PhaseResult(State.FAILED, f"fatal: {e}")
 
         except Exception as e:
             if is_task_cancelled(task_id):
                 write_phase_status(workspace, State.CANCELLED.value, "任务已取消")
+                if tracer:
+                    tracer.log_phase_end(current.value, error="cancelled")
                 raise TaskCancelledError(f"task {task_id} cancelled during {current.value}") from e
             logger.exception("Unexpected error in %s: %s", current.value, e)
             task.error_log = f"unexpected: {e}"
             save_task(task)
             if tracer:
-                tracer.log_phase(current.value, error=str(e))
+                tracer.log_phase_end(current.value, error=f"unexpected: {type(e).__name__}: {e}")
             return PhaseResult(State.FAILED, f"unexpected: {e}")
 
     # ------------------------------------------------------------------
@@ -291,3 +308,105 @@ def _phase_label(state: str) -> str:
         "cancelled": "已取消",
     }
     return labels.get(state, state)
+
+
+# ─── LangSmith 阶段 inputs/outputs 构建 ──────────────────────────────────────
+
+def _phase_inputs(task: "Task", phase: str, workspace: "Path") -> dict:
+    """
+    为每个阶段收集对排查真正有用的上下文。
+    出现在 LangSmith 的 Run inputs 面板中。
+    """
+    import json as _json
+
+    base: dict = {
+        "task_id":    task.task_id,
+        "level":      task.level,
+        "phase":      phase,
+        "requirement": task.raw_requirement[:500],
+    }
+    if task.site_hint:
+        base["site_hint"] = task.site_hint
+
+    # coding → 显示 fix_prompt（如果有）
+    if phase in ("coding", "correcting"):
+        fix_path = workspace / "single_fix_prompt.md"
+        if fix_path.is_file():
+            try:
+                base["fix_prompt_snippet"] = fix_path.read_text(errors="replace")[:1500]
+            except OSError:
+                pass
+
+    # building → 显示上一次构建错误（如果有）
+    if phase == "building":
+        err_path = workspace / "build_error.txt"
+        if err_path.is_file():
+            try:
+                base["prev_build_error"] = err_path.read_text(errors="replace")[-1500:]
+            except OSError:
+                pass
+
+    # correcting → 显示 fix_plan 摘要
+    if phase == "correcting":
+        fp_path = workspace / "fix_plan.json"
+        if fp_path.is_file():
+            try:
+                fp = _json.loads(fp_path.read_text())
+                items = fp if isinstance(fp, list) else fp.get("items", [])
+                base["fix_items_count"] = len(items)
+                base["fix_priorities"]  = [i.get("priority") for i in items[:5]]
+            except Exception:
+                pass
+
+    # review phases → 显示 review 结论
+    if phase in ("codex_review", "architect_review", "red_team_review", "requirement_review", "self_review"):
+        report_map = {
+            "codex_review":        "codex_review.md",
+            "architect_review":    "architect_review.md",
+            "red_team_review":     "red_team_review.md",
+            "requirement_review":  "requirement_review.md",
+            "self_review":         "self_review.md",
+        }
+        rp = workspace / report_map.get(phase, "")
+        if rp.is_file():
+            try:
+                base["prev_review_snippet"] = rp.read_text(errors="replace")[:1000]
+            except OSError:
+                pass
+
+    return base
+
+
+def _phase_outputs(task: "Task", result: "PhaseResult", workspace: "Path") -> dict:
+    """
+    记录阶段执行结果，供 LangSmith 展示。
+    出现在 Run outputs 面板中。
+    """
+    import json as _json
+
+    out: dict = {
+        "next_state": result.next_state.value,
+        "reason":     result.reason or "",
+    }
+
+    # building → 显示构建成功/失败
+    if task.current_state == "building":
+        err_path = workspace / "build_error.txt"
+        if err_path.is_file():
+            try:
+                out["build_error"] = err_path.read_text(errors="replace")[-2000:]
+            except OSError:
+                pass
+
+    # coding → 显示 apply_diag
+    if task.current_state == "coding":
+        diag_path = workspace / "coding_apply_diag.json"
+        if diag_path.is_file():
+            try:
+                diag = _json.loads(diag_path.read_text())
+                out["files_applied"]    = diag.get("applied_count", 0)
+                out["file_markers"]     = diag.get("file_markers_found", 0)
+            except Exception:
+                pass
+
+    return out
