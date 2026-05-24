@@ -207,8 +207,8 @@ class PlanningHandler(PhaseHandler):
         if not re.search(r"(验收|测试|标准|验证|编译|build|expect|should|must)", req, re.I):
             questions.append("验收标准或期望行为是什么？")
 
-        # L0 明确小改豁免
-        if task.level == "L0" and len(questions) <= 1:
+        # L0 明确小改豁免：最多允许 2 个模糊点（缺页面+缺站点仍放行）
+        if task.level == "L0" and len(questions) <= 2:
             return False, [], "L0 clear enough"
 
         if not questions:

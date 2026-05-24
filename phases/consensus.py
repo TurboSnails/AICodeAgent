@@ -218,8 +218,9 @@ class ConsensusHandler(PhaseHandler):
                 if "sitecapsregistry" not in text_lower:
                     violations.append({"label": label, "detail": "SiteCapsRegistry not mentioned"})
             elif label == "UIState 不可变":
-                if "var " in text_lower and "uistate" in text_lower:
-                    violations.append({"label": label, "detail": "mutable var found in UIState context"})
+                # 只匹配实际的可变字段声明（var x: UIState 或 var uiState），排除描述性文字误报
+                if re.search(r"\bvar\s+\w+\s*:\s*\w*[Uu][Ii][Ss]tate|\bvar\s+ui[Ss]tate\b", architect_text):
+                    violations.append({"label": label, "detail": "mutable var found in UIState field declaration"})
             elif label == "collectAsStateWithLifecycle":
                 if "collectasstatewithlifecycle" not in text_lower and "collectasstate" in text_lower:
                     violations.append({"label": label, "detail": "using collectAsState instead of collectAsStateWithLifecycle"})

@@ -558,11 +558,12 @@ class AIClient:
 
     @staticmethod
     def _kill_stale_claude_cli() -> None:
-        """超时后清理残留 claude -p / --print 子进程。"""
+        """超时后清理残留 claude -p / --print 子进程（限当前用户 UID，避免误杀）。"""
+        uid = str(os.getuid())
         for pattern in ("claude -p", "claude --print"):
             try:
                 subprocess.run(
-                    ["pkill", "-f", pattern],
+                    ["pkill", "-U", uid, "-f", pattern],
                     capture_output=True,
                     timeout=5,
                 )

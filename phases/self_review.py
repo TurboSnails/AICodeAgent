@@ -133,6 +133,7 @@ class SelfReviewHandler(PhaseHandler):
         # 7. 不自查通过 → 更新计数器并检查重试上限
         self_review_round = task.phase_counters.get("self_review", 0) + 1
         task.phase_counters["self_review"] = self_review_round
+        task.phase_counters["last_fail_stage"] = "self_review"
         task.error_log = report[:4000]
         save_task(task)
 
